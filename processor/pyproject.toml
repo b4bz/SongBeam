@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=70", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "songbeam-processor"
+version = "0.1.0"
+description = "Bounded offline directional processing for four-channel SongBeam audio"
+requires-python = ">=3.11"
+dependencies = ["numpy>=2.0,<3", "scipy>=1.13,<2", "soundfile>=0.12,<1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "ruff==0.16.10"]
+
+[project.scripts]
+songbeam = "songbeam.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
