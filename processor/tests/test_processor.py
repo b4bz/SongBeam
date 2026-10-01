@@ -12,9 +12,9 @@ from scipy.signal import butter, sosfilt
 
 import songbeam.process as processing
 from songbeam.audio import beam_fft, inspect, read_block, riff_pcm
-from songbeam.cli import analyze_mono, retry_destination
+from songbeam.cli import analyze_mono, cross_beam_overlaps, retry_destination
 from songbeam.localize import candidates, track_blocks
-from songbeam.process import OutputSet, Settings, _calibrate, process
+from songbeam.process import OutputSet, Settings, _calibrate, _mount_guard, process
 
 FS = 44100
 POSITIONS = np.array([0, 0.045, 0.075, 0.12])
@@ -135,6 +135,12 @@ def test_birdnet_rejects_multichannel_and_false_success(tmp_path):
         json.loads((tmp_path / "results2/job-status.json").read_text())["status"]
         == "failed"
     )
+    batch = tmp_path / "batch"
+    batch.mkdir()
+    sf.write(batch / "same.wav", a[:, 0], FS, subtype="PCM_16")
+    sf.write(batch / "same.flac", a[:, 0], FS, subtype="PCM_16")
+    with pytest.raises(ValueError, match="unique stems"):
+        analyze_mono(batch, tmp_path / "results3", "/bin/true", 0.25)
 
 
 def test_space_rejection_and_failure_retry_retains_old_attempt(tmp_path, monkeypatch):
@@ -213,3 +219,25 @@ def test_chunk_boundaries_match_full_directional_signal(tmp_path):
             pieces.append(beam_fft(block, first, start, FS, FS, 0.72))
     actual = np.concatenate(pieces)
     assert np.sqrt(np.mean((expected - actual) ** 2)) < 1e-5
+
+
+def test_cross_beam_report_flags_overlap_without_merging_predictions(tmp_path):
+    header = "Start (s),End (s),Scientific name,Common name,Confidence,File\n"
+    first = tmp_path / "track-001.BirdNET.results.csv"
+    second = tmp_path / "track-002.BirdNET.results.csv"
+    first.write_text(header + "3,6,Testus birdus,Test Bird,0.82,one.flac\n")
+    second.write_text(
+        header
+        + "4,7,Testus birdus,Test Bird,0.71,two.flac\n"
+        + "4,7,Otherus birdus,Other Bird,0.95,two.flac\n"
+    )
+    before = (first.read_bytes(), second.read_bytes())
+    matched = cross_beam_overlaps([first, second])
+    assert len(matched) == 1
+    assert matched[0]["scientific_name"] == "Testus birdus"
+    assert before == (first.read_bytes(), second.read_bytes())
+
+
+def test_required_data_mount_rejects_plain_directory(tmp_path):
+    with pytest.raises(OSError, match="not mounted"):
+        _mount_guard(tmp_path, tmp_path)

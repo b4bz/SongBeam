@@ -90,8 +90,12 @@ class OutputSet:
         self.root, self.track, self.rate = root, track, rate
         self.settings = settings
         self.dither = np.random.default_rng(0x5342 + track)
+        self.peak = 0.0
+        self.clipped_frames = 0
         self.writers: dict[str, sf.SoundFile | subprocess.Popen] = {}
         self.paths: dict[str, Path] = {}
+        if "mp3" in settings.formats and shutil.which("ffmpeg") is None:
+            raise RuntimeError("FFmpeg with libmp3lame is required for MP3")
         for fmt in settings.formats:
             final = root / f"track-{track:03d}.{fmt}"
             if final.exists():
@@ -99,10 +103,10 @@ class OutputSet:
             temp = root / f"track-{track:03d}.{fmt}.part"
             if temp.exists():
                 raise FileExistsError(temp)
+        for fmt in settings.formats:
+            temp = root / f"track-{track:03d}.{fmt}.part"
             self.paths[fmt] = temp
             if fmt == "mp3":
-                if shutil.which("ffmpeg") is None:
-                    raise RuntimeError("FFmpeg with libmp3lame is required for MP3")
                 command = [
                     "ffmpeg",
                     "-hide_banner",
@@ -152,6 +156,8 @@ class OutputSet:
                 )
 
     def write(self, audio: np.ndarray) -> None:
+        self.peak = max(self.peak, float(np.max(np.abs(audio))))
+        self.clipped_frames += int(np.count_nonzero(np.abs(audio) >= 1.0))
         # Quantize each bit depth once so WAV and FLAC receive identical PCM.
         quantized: dict[int, np.ndarray] = {}
         for fmt, writer in self.writers.items():
@@ -269,6 +275,18 @@ def _space_guard(parent: Path, required: int, reserve_gib: float) -> None:
         )
 
 
+def _mount_guard(parent: Path, mount: Path | None) -> None:
+    if mount is None:
+        return
+    if not mount.is_mount():
+        raise OSError("Required data filesystem is not mounted")
+    resolved = mount.resolve(strict=True)
+    if not parent.resolve(strict=True).is_relative_to(resolved):
+        raise ValueError("Output is outside the required data filesystem")
+    if parent.stat().st_dev != resolved.stat().st_dev:
+        raise OSError("Output filesystem differs from required mount")
+
+
 def _resolve_output(input_path: Path, output: Path) -> tuple[Path, Path]:
     source = input_path.resolve(strict=True)
     parent = output.parent.resolve(strict=True)
@@ -280,10 +298,15 @@ def _resolve_output(input_path: Path, output: Path) -> tuple[Path, Path]:
 
 
 def process(
-    input_path: Path, output: Path, settings: Settings, retry_of: str | None = None
+    input_path: Path,
+    output: Path,
+    settings: Settings,
+    retry_of: str | None = None,
+    required_mount: Path | None = None,
 ) -> dict:
     settings.validate()
     source, destination = _resolve_output(input_path, output)
+    _mount_guard(destination.parent, required_mount)
     details = inspect(source, settings.channel_map)
     rate = int(details["sample_rate"])
     frames = int(details["frames"])
@@ -335,9 +358,13 @@ def process(
         "block_frames": block_len,
         "tracks": [],
         "outputs": {},
+        "output_diagnostics": {},
+        "gain_policy": "equal_four_channel_weights_no_automatic_gain",
+        "pcm_dither": "deterministic_TPDF_at_target_bit_depth",
     }
     if retry_of is not None:
         manifest["retry_of"] = retry_of
+    manifest["required_mount_checked"] = required_mount is not None
     writers: list[OutputSet] = []
     try:
         writers = [
@@ -404,6 +431,7 @@ def process(
                         }
                     )
                 if index % 30 == 0:
+                    _mount_guard(destination, required_mount)
                     _space_guard(
                         destination,
                         min(
@@ -415,7 +443,12 @@ def process(
                         settings.reserve_gib,
                     )
         for i, writer in enumerate(writers):
-            manifest["outputs"][f"track-{i + 1:03d}"] = writer.close()
+            name = f"track-{i + 1:03d}"
+            manifest["outputs"][name] = writer.close()
+            manifest["output_diagnostics"][name] = {
+                "peak_float": writer.peak,
+                "clipped_frames": writer.clipped_frames,
+            }
         manifest["status"] = "complete"
     except BaseException as error:
         for writer in writers:
@@ -429,4 +462,9 @@ def process(
         temp = destination / "manifest.json.part"
         temp.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
         temp.replace(destination / "manifest.json")
+        directory_fd = os.open(destination, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     return manifest

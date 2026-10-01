@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import shutil
 import subprocess
@@ -87,28 +88,64 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--block-seconds", type=float, default=0.5)
     run.add_argument("--reserve-gib", type=float, default=8)
     run.add_argument(
+        "--require-mount",
+        type=Path,
+        default=None,
+        help="require output to remain on this mounted data filesystem",
+    )
+    run.add_argument(
         "--resume",
         action="store_true",
         help="restart a failed/canceled job in a new sibling directory",
     )
     birdnet = sub.add_parser(
-        "analyze", help="run BirdNET on one validated mono derivative"
+        "analyze", help="run BirdNET on mono files or a flat mono directory"
     )
     birdnet.add_argument("input", type=Path)
     birdnet.add_argument("--output", type=Path, required=True)
     birdnet.add_argument("--executable", default="birdnet-analyze")
     birdnet.add_argument("--min-conf", type=float, default=0.25)
+    birdnet.add_argument("--threads", type=int, default=2)
+    birdnet.add_argument("--batch-size", type=int, default=8)
     return p
 
 
 def analyze_mono(
-    input_path: Path, output: Path, executable: str, min_conf: float
+    input_path: Path,
+    output: Path,
+    executable: str,
+    min_conf: float,
+    threads: int = 2,
+    batch_size: int = 8,
 ) -> dict:
-    info = sf.info(str(input_path))
-    if info.channels != 1 or info.frames < 1 or info.format not in {"WAV", "FLAC"}:
-        raise ValueError("BirdNET input must be nonempty mono WAV or FLAC")
+    if input_path.is_symlink():
+        raise ValueError("BirdNET input symlinks are not accepted")
+    if input_path.is_dir():
+        if any(item.is_dir() or item.is_symlink() for item in input_path.iterdir()):
+            raise ValueError(
+                "BirdNET batch input must be a flat directory without symlinks"
+            )
+        files = sorted(
+            item
+            for item in input_path.iterdir()
+            if item.suffix.lower() in {".wav", ".flac"}
+        )
+    else:
+        files = [input_path]
+    if not files:
+        raise ValueError("BirdNET input has no lossless files")
+    if len({path.stem for path in files}) != len(files):
+        raise ValueError("BirdNET input filenames must have unique stems")
+    for path in files:
+        info = sf.info(str(path))
+        if info.channels != 1 or info.frames < 1 or info.format not in {"WAV", "FLAC"}:
+            raise ValueError(
+                f"BirdNET input must be nonempty mono WAV or FLAC: {path.name}"
+            )
     if not 0 < min_conf < 1:
         raise ValueError("min_conf must be between 0 and 1")
+    if not 1 <= threads <= 8 or not 1 <= batch_size <= 32:
+        raise ValueError("threads must be 1–8 and batch size 1–32")
     if output.exists():
         raise FileExistsError(output)
     if shutil.which(executable) is None:
@@ -124,25 +161,119 @@ def analyze_mono(
         "csv",
         "--min_conf",
         str(min_conf),
+        "--threads",
+        str(threads),
+        "--batch_size",
+        str(batch_size),
     ]
     result = subprocess.run(command, text=True, capture_output=True, check=False)
-    expected = output / (input_path.stem + ".BirdNET.results.csv")
+    expected = [output / (path.stem + ".BirdNET.results.csv") for path in files]
+    params = output / "BirdNET_analysis_params.csv"
     if (
         result.returncode
         or "Error: Cannot" in (result.stdout + result.stderr)
-        or not expected.is_file()
+        or any(not path.is_file() for path in expected)
+        or not params.is_file()
     ):
         (output / "job-status.json").write_text(
-            json.dumps({"status": "failed", "exit_code": result.returncode}) + "\n"
+            json.dumps(
+                {
+                    "status": "failed",
+                    "exit_code": result.returncode,
+                    "expected_files": len(files),
+                    "found_results": sum(path.is_file() for path in expected),
+                }
+            )
+            + "\n"
         )
         raise RuntimeError("BirdNET failed or omitted its result CSV")
     status = {
         "status": "complete",
-        "result": expected.name,
-        "parameters": "BirdNET_analysis_params.csv",
+        "input_count": len(files),
+        "model_run": "external-BirdNET-Analyzer",
+        "inputs": [{"name": path.name, "sha256": sha256_file(path)} for path in files],
+        "results": [
+            {"name": path.name, "sha256": sha256_file(path)} for path in expected
+        ],
+        "parameters": {"name": params.name, "sha256": sha256_file(params)},
     }
+    if len(expected) > 1:
+        try:
+            overlaps = cross_beam_overlaps(expected)
+        except (ValueError, OSError) as error:
+            status["status"] = "failed"
+            status["postprocess_error"] = type(error).__name__
+            (output / "job-status.json").write_text(json.dumps(status, indent=2) + "\n")
+            raise
+        report_path = output / "possible_cross_beam_overlaps.csv"
+        with report_path.open("w", newline="") as stream:
+            writer = csv.DictWriter(
+                stream,
+                fieldnames=[
+                    "file_a",
+                    "file_b",
+                    "scientific_name",
+                    "start_a_s",
+                    "end_a_s",
+                    "start_b_s",
+                    "end_b_s",
+                    "confidence_a",
+                    "confidence_b",
+                ],
+            )
+            writer.writeheader()
+            writer.writerows(overlaps)
+        status["possible_cross_beam_overlaps"] = {
+            "name": report_path.name,
+            "count": len(overlaps),
+            "sha256": sha256_file(report_path),
+        }
     (output / "job-status.json").write_text(json.dumps(status, indent=2) + "\n")
     return status
+
+
+def cross_beam_overlaps(result_paths: list[Path]) -> list[dict]:
+    """Flag same-species temporal overlap; retain original predictions separately."""
+    detections = []
+    for path in result_paths:
+        with path.open(newline="") as stream:
+            reader = csv.DictReader(stream)
+            required = {"Start (s)", "End (s)", "Scientific name", "Confidence"}
+            if not required.issubset(set(reader.fieldnames or [])):
+                raise ValueError(f"BirdNET result missing columns: {path.name}")
+            for row in reader:
+                start = float(row["Start (s)"])
+                end = float(row["End (s)"])
+                confidence = float(row["Confidence"])
+                if not (0 <= start < end and 0 <= confidence <= 1):
+                    raise ValueError(
+                        f"BirdNET result has invalid timing/score: {path.name}"
+                    )
+                detections.append(
+                    (path.name, row["Scientific name"], start, end, confidence)
+                )
+    matches = []
+    for i, first in enumerate(detections):
+        for second in detections[i + 1 :]:
+            if first[0] == second[0] or first[1] != second[1]:
+                continue
+            shared = min(first[3], second[3]) - max(first[2], second[2])
+            if shared < 0.5 * min(first[3] - first[2], second[3] - second[2]):
+                continue
+            matches.append(
+                {
+                    "file_a": first[0],
+                    "file_b": second[0],
+                    "scientific_name": first[1],
+                    "start_a_s": first[2],
+                    "end_a_s": first[3],
+                    "start_b_s": second[2],
+                    "end_b_s": second[3],
+                    "confidence_a": first[4],
+                    "confidence_b": second[4],
+                }
+            )
+    return matches
 
 
 def retry_destination(prior: Path, source: Path, settings: Settings) -> Path:
@@ -202,10 +333,16 @@ def main() -> int:
                 destination,
                 settings,
                 retry_of=args.output.name if args.resume else None,
+                required_mount=args.require_mount,
             )
         else:
             result = analyze_mono(
-                args.input, args.output, args.executable, args.min_conf
+                args.input,
+                args.output,
+                args.executable,
+                args.min_conf,
+                args.threads,
+                args.batch_size,
             )
         print(json.dumps(result, indent=2))
         return 0

@@ -20,7 +20,7 @@ These are proposed changes. They are not implemented by this documentation commi
 | One automatic beam and manually selected directions | Implemented and synthetic-tested | Improve a chosen calling direction with an inspectable fallback. |
 | Up to two tracked directional exports | Experimental, synthetic-tested | Make overlapping callers easier to review when spatially resolvable. |
 | WAV, FLAC and MP3 output choices | Implemented and synthetic-tested | Support analysis, archival storage and listening. |
-| BirdNET input/result validation and failed-job restart | Implemented for one file; multi-file batch pending | Prevent silent downmixing and false-success jobs. |
+| BirdNET input/result validation and failed-job restart | Implemented for files and flat mono batches | Prevent silent downmixing and false-success jobs. |
 | Privacy controls, ignore rules and security policy | Local hooks/CI source ready; remote controls pending | Keep field data, secrets and private site information out of a public fork. |
 
 ## Intended processing workflow
@@ -49,6 +49,8 @@ uv run --directory processor songbeam process /path/to/raw.wav --output /path/to
 uv run --directory processor songbeam process /path/to/raw.wav --output /path/to/manual-run \
   --channel-map 0,1,2,3 --manual-angle 20 --manual-angle -30 --format flac
 ```
+
+For a production data drive, add `--require-mount /path/to/data-drive` and place `--output` under that mount. The command stops if that filesystem is absent or changes during processing. The default scratch example above requires an explicitly chosen output directory.
 
 `--channel-map` is explicit because the file-to-physical-microphone wiring has not been verified for this user's board. Optional `--gains`, `--polarities`, `--fixed-delays-samples` and `--calibration-id` record and apply four-channel calibration; defaults are identity and require physical verification. Angles are from array broadside and retain front/back ambiguity. The input validator rejects missing/extra RIFF bytes and unsupported four-channel formats; it never repairs the source. Each new output directory contains separate full-timeline mono tracks plus `manifest.json` with hashes, processing settings, direction estimates and activity. Existing output directories are refused. Source WAV stays unchanged. Track 2 is emitted only when three consecutive analysis blocks support a distinct second direction; uncertain intervals are marked inactive. The two-track result is experimental and may contain bleed or track swaps. The active algorithm is normalized delay-and-sum after all-six-pair SRP-PHAT direction scoring. MVDR/LCMV remain research candidates, not shipped modes.
 

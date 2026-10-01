@@ -54,6 +54,7 @@ int recDay[7]={1,1,1,1,1,1,1};
 int mode = 0;  // 0=stopped, 1=recording, 2=playing
 FsFile frec;
 bool recordingFailed = false;
+int maxQueueDepth = 0;
 elapsedMillis  msecs;
 
 int filecount=0;
@@ -132,6 +133,11 @@ void setup() {
   
   pinMode(PIN_POWER, OUTPUT);
   digitalWrite(PIN_POWER, LOW);
+  if (year() < 2020 || year() > 2100) {
+    Serial.println("Invalid RTC: recording disabled");
+    digitalWrite(PIN_POWER, HIGH);
+    while (1) delay(1000);
+  }
 
   Serial.println(devname);
   Serial.println(starttimemin);
@@ -289,6 +295,7 @@ char* startRecordingChannels(unsigned int channels) {
   if (channels == 4) { queue1a.begin(); queue2a.begin(); }
   mode = 1;
   recByteSaved = 0;
+  maxQueueDepth = 0;
   return filename;
 }
 
@@ -313,12 +320,20 @@ void writeInterleavedBlock(unsigned int channels) {
 
 void continueRecording() {
 
+  if (queue1.available() > maxQueueDepth) maxQueueDepth = queue1.available();
+  if (queue2.available() > maxQueueDepth) maxQueueDepth = queue2.available();
+  if (queue1a.available() > maxQueueDepth) maxQueueDepth = queue1a.available();
+  if (queue2a.available() > maxQueueDepth) maxQueueDepth = queue2a.available();
+
   if (queue1.available() >= 2 && queue2.available() >= 2 && queue1a.available() >=2 && queue2a.available() >=2) {
     writeInterleavedBlock(4);
   } 
 }
 
 void continueRecording2Chan() {
+
+  if (queue1.available() > maxQueueDepth) maxQueueDepth = queue1.available();
+  if (queue2.available() > maxQueueDepth) maxQueueDepth = queue2.available();
 
   if (queue1.available() >= 2 && queue2.available() >= 2) {
     writeInterleavedBlock(2);
@@ -334,11 +349,13 @@ void stopRecording(char* fn) {
   queue2a.end();
   if (mode == 1) {
     while (!recordingFailed && queue1.available() > 0 && queue2.available() > 0 && queue1a.available() > 0 && queue2a.available() > 0) writeInterleavedBlock(4);
+    if (queue1.available() || queue2.available() || queue1a.available() || queue2a.available()) recordingFailed = true;
     if (!frec.seek(44ULL + recByteSaved) || !frec.truncate()) recordingFailed = true;
     if (!writeOutHeader() || !frec.sync()) recordingFailed = true;
     frec.close();
     if (recordingFailed) Serial.println("Recording incomplete: inspect WAV before processing");
     Serial.print("Max audio memory blocks: "); Serial.println(AudioMemoryUsageMax());
+    Serial.print("Max queue depth: "); Serial.println(maxQueueDepth);
   }
   mode = 0;
   //Serial.print("finishedRecording ");
@@ -352,11 +369,13 @@ void stopRecording2Chan(char* fn) {
   queue2.end();
   if (mode == 1) {
     while (!recordingFailed && queue1.available() > 0 && queue2.available() > 0) writeInterleavedBlock(2);
+    if (queue1.available() || queue2.available()) recordingFailed = true;
     if (!frec.seek(44ULL + recByteSaved) || !frec.truncate()) recordingFailed = true;
     if (!writeOutHeader() || !frec.sync()) recordingFailed = true;
     frec.close();
     if (recordingFailed) Serial.println("Recording incomplete: inspect WAV before processing");
     Serial.print("Max audio memory blocks: "); Serial.println(AudioMemoryUsageMax());
+    Serial.print("Max queue depth: "); Serial.println(maxQueueDepth);
   }
   mode = 0;
   //Serial.print("finishedRecording ");
