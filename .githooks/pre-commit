@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+set -euo pipefail
+python3 scripts/check_repository_policy.py
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo 'gitleaks is required for commits; install the pinned version from SECURITY.md.' >&2
+  exit 1
+fi
+gitleaks git --staged --redact=100 --no-banner --log-level warn .
