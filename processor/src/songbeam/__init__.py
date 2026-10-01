@@ -1,3 +1,3 @@
 """Independent SongBeam offline processor; no Luscinia code is included."""
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"

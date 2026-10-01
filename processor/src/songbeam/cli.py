@@ -8,13 +8,14 @@ import json
 import shutil
 import subprocess
 import sys
+from collections import defaultdict
 from pathlib import Path
 
 import soundfile as sf
 
 from . import __version__
 from .audio import inspect, sha256_file
-from .process import Settings, process
+from .process import Settings, _mount_guard, process
 
 
 def _mapping(value: str) -> tuple[int, int, int, int]:
@@ -107,6 +108,7 @@ def parser() -> argparse.ArgumentParser:
     birdnet.add_argument("--min-conf", type=float, default=0.25)
     birdnet.add_argument("--threads", type=int, default=2)
     birdnet.add_argument("--batch-size", type=int, default=8)
+    birdnet.add_argument("--require-mount", type=Path, default=None)
     return p
 
 
@@ -117,6 +119,7 @@ def analyze_mono(
     min_conf: float,
     threads: int = 2,
     batch_size: int = 8,
+    required_mount: Path | None = None,
 ) -> dict:
     if input_path.is_symlink():
         raise ValueError("BirdNET input symlinks are not accepted")
@@ -151,6 +154,7 @@ def analyze_mono(
     if shutil.which(executable) is None:
         raise FileNotFoundError(executable)
     output.parent.resolve(strict=True)
+    _mount_guard(output.parent, required_mount)
     output.mkdir(mode=0o750)
     command = [
         executable,
@@ -233,8 +237,8 @@ def analyze_mono(
 
 
 def cross_beam_overlaps(result_paths: list[Path]) -> list[dict]:
-    """Flag same-species temporal overlap; retain original predictions separately."""
-    detections = []
+    """Flag same-species temporal overlap without altering original predictions."""
+    by_species = defaultdict(list)
     for path in result_paths:
         with path.open(newline="") as stream:
             reader = csv.DictReader(stream)
@@ -249,30 +253,36 @@ def cross_beam_overlaps(result_paths: list[Path]) -> list[dict]:
                     raise ValueError(
                         f"BirdNET result has invalid timing/score: {path.name}"
                     )
-                detections.append(
-                    (path.name, row["Scientific name"], start, end, confidence)
+                by_species[row["Scientific name"]].append(
+                    (path.name, start, end, confidence)
                 )
     matches = []
-    for i, first in enumerate(detections):
-        for second in detections[i + 1 :]:
-            if first[0] == second[0] or first[1] != second[1]:
-                continue
-            shared = min(first[3], second[3]) - max(first[2], second[2])
-            if shared < 0.5 * min(first[3] - first[2], second[3] - second[2]):
-                continue
-            matches.append(
-                {
-                    "file_a": first[0],
-                    "file_b": second[0],
-                    "scientific_name": first[1],
-                    "start_a_s": first[2],
-                    "end_a_s": first[3],
-                    "start_b_s": second[2],
-                    "end_b_s": second[3],
-                    "confidence_a": first[4],
-                    "confidence_b": second[4],
-                }
-            )
+    for scientific_name, detections in by_species.items():
+        active = []
+        for entry in sorted(detections, key=lambda item: item[1]):
+            active = [old for old in active if old[2] > entry[1]]
+            for old in active:
+                if old[0] == entry[0]:
+                    continue
+                shared = min(old[2], entry[2]) - max(old[1], entry[1])
+                if shared < 0.5 * min(old[2] - old[1], entry[2] - entry[1]):
+                    continue
+                matches.append(
+                    {
+                        "file_a": old[0],
+                        "file_b": entry[0],
+                        "scientific_name": scientific_name,
+                        "start_a_s": old[1],
+                        "end_a_s": old[2],
+                        "start_b_s": entry[1],
+                        "end_b_s": entry[2],
+                        "confidence_a": old[3],
+                        "confidence_b": entry[3],
+                    }
+                )
+                if len(matches) > 100000:
+                    raise ValueError("Cross-beam overlap report exceeds safe size")
+            active.append(entry)
     return matches
 
 
@@ -343,6 +353,7 @@ def main() -> int:
                 args.min_conf,
                 args.threads,
                 args.batch_size,
+                args.require_mount,
             )
         print(json.dumps(result, indent=2))
         return 0
