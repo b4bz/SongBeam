@@ -1,6 +1,6 @@
 # SongBeam — recorder and proposed offline processing extensions
 
-SongBeam is an open bioacoustic recorder created by **Lies Zandberg and Robert Lachlan**, associated with Royal Holloway University of London. This README is prepared for a fork of [the original SongBeam project](https://github.com/lzandberg/SongBeam). The repository contains its hardware designs, enclosure and Teensy recording sketch. Original project documentation is at [CuCo](https://www.cuco.group/songbeam); hardware is distributed by [LabMaker](https://www.labmaker.org/products/songbeam).
+SongBeam is an open bioacoustic recorder created by **Lies Zandberg and Robert Lachlan**, associated with Royal Holloway University of London. This is [a fork of the original SongBeam project](https://github.com/lzandberg/SongBeam). The repository retains its hardware designs, enclosure and Teensy recording sketch, and adds an independent offline processor. Original project documentation is at [CuCo](https://www.cuco.group/songbeam); hardware is distributed by [LabMaker](https://www.labmaker.org/products/songbeam).
 
 ## Original capabilities
 
@@ -21,7 +21,7 @@ These are proposed changes. They are not implemented by this documentation commi
 | Up to two tracked directional exports | Experimental, synthetic-tested | Make overlapping callers easier to review when spatially resolvable. |
 | WAV, FLAC and MP3 output choices | Implemented and synthetic-tested | Support analysis, archival storage and listening. |
 | BirdNET input/result validation and failed-job restart | Implemented for files and flat mono batches | Prevent silent downmixing and false-success jobs. |
-| Privacy controls, ignore rules and security policy | Local hooks/CI source ready; remote controls pending | Keep field data, secrets and private site information out of a public fork. |
+| Privacy controls, ignore rules and security policy | Active in the fork; see `SECURITY.md` | Keep field data, secrets and private site information out of a public fork. |
 
 ## Intended processing workflow
 
