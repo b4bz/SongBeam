@@ -18,6 +18,11 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/uv-install"
           "$RUNNER_TEMP/uv-install/bin/pip" install uv==0.11.7
           "$RUNNER_TEMP/uv-install/bin/uv" sync --directory processor --extra dev --locked
+      - name: Install FFmpeg codec runtime
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libmp3lame
       - name: Synthetic processor tests
         run: |
           "$RUNNER_TEMP/uv-install/bin/uv" run --directory processor ruff check src tests
