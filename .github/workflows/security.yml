@@ -36,4 +36,5 @@ jobs:
       - name: Scan introduced history
         env:
           BASE_SHA: ${{ steps.comparison.outputs.base }}
-        run: "$RUNNER_TEMP/gitleaks" git --log-opts="${BASE_SHA}..HEAD" --redact=100 --no-banner --log-level warn .
+        run: |
+          "$RUNNER_TEMP/gitleaks" git --log-opts="${BASE_SHA}..HEAD" --redact=100 --no-banner --log-level warn .
