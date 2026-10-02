@@ -1,4 +1,4 @@
-# SongBeam — recorder and proposed offline processing extensions
+# SongBeam — recorder and offline array processing
 
 SongBeam is an open bioacoustic recorder created by **Lies Zandberg and Robert Lachlan**, associated with Royal Holloway University of London. This is [a fork of the original SongBeam project](https://github.com/lzandberg/SongBeam). The repository retains its hardware designs, enclosure and Teensy recording sketch, and adds an independent offline processor. Original project documentation is at [CuCo](https://www.cuco.group/songbeam); hardware is distributed by [LabMaker](https://www.labmaker.org/products/songbeam).
 
@@ -10,12 +10,14 @@ Upstream baseline: `f1ee97e37906403cce5ea79b3501abc3c4fa7c52`. Code review ident
 
 ## Extension status
 
-These are proposed changes. They are not implemented by this documentation commit; update each row as its acceptance tests pass.
+The independent processor is version 0.2.0 in this checkout. Device calibration and outdoor performance remain to be measured.
 
 | Feature | Status | Practical purpose |
 | --- | --- | --- |
 | Correct WAV header reservation, interleaved final buffers and checked writes | Compiles; physical bench validation pending | Preserve channel alignment and detect SD failures. |
-| Strict input validation and explicit channel map | Implemented for four-channel PCM16 WAV; physical channel mapping unverified | Reject malformed files and report dead/clipped channels. |
+| Strict input validation and explicit channel layout | Implemented for profiled PCM16 WAV, including 4/6/8-channel layouts; physical mapping unverified | Reject malformed files and report dead/clipped selected microphones. |
+| Versioned array profiles and source selection | Implemented; synthetic-tested | One processor supports SongBeam, Sipeed D80 and bounded custom geometry. |
+| Direction estimation for both arrays | Implemented; synthetic-tested | SongBeam signed projection/angle and compatible bearings; Sipeed local azimuth and elevation magnitude with mirror ambiguity. |
 | Streaming mono beamformed exporter | Implemented and synthetic-tested | Process long recordings with bounded memory and reproducible output. |
 | One automatic beam and manually selected directions | Implemented and synthetic-tested | Improve a chosen calling direction with an inspectable fallback. |
 | Up to two tracked directional exports | Experimental, synthetic-tested | Make overlapping callers easier to review when spatially resolvable. |
@@ -25,9 +27,9 @@ These are proposed changes. They are not implemented by this documentation commi
 
 ## Intended processing workflow
 
-Validate original four-channel WAV → apply calibrated channel mapping → estimate stable direction(s) → export one or more mono directional tracks → optionally classify lossless tracks with BirdNET → review results alongside a single original channel. Preserve original WAVs and a manifest linking every derivative to source, parameters and software versions.
+Validate the original WAV → select source profile and input layout → apply separately verified device calibration when available → estimate supported direction(s) → export one or more mono directional tracks → optionally classify lossless tracks with BirdNET → review results alongside a selected original channel. Preserve original WAVs and a manifest linking every derivative to source, profile, parameters and software versions.
 
-The array is linear, with reviewed microphone centers at 0, 45, 75 and 120 mm. Direction is measured relative to that axis; front/back and other equal-projection ambiguities remain. Separate tracks can retain other birds and noise. A track is not an identified individual bird, and multiple exported beams do not establish a bird count. Same-direction callers may remain an unresolved mixture.
+SongBeam's array is linear, with reviewed microphone centers at 0, 45, 75 and 120 mm; it measures a direction projection and has equal-projection ambiguity. The nominal Sipeed D80 profile uses six outer microphones on a 40 mm radius ring. Its planar geometry has an above/below ambiguity. Separate tracks can retain other birds and noise. A track is not an identified individual bird, and multiple exported beams do not establish a bird count. Same-direction callers may remain an unresolved mixture.
 
 ## Planned output choices
 
@@ -52,7 +54,7 @@ uv run --directory processor songbeam process /path/to/raw.wav --output /path/to
 
 For a production data drive, add `--require-mount /path/to/data-drive` and place `--output` under that mount. The command stops if that filesystem is absent or changes during processing. The default scratch example above requires an explicitly chosen output directory.
 
-`--channel-map` is explicit because the file-to-physical-microphone wiring has not been verified for this user's board. Optional `--gains`, `--polarities`, `--fixed-delays-samples` and `--calibration-id` record and apply four-channel calibration; defaults are identity and require physical verification. Angles are from array broadside and retain front/back ambiguity. The input validator rejects missing/extra RIFF bytes and unsupported four-channel formats; it never repairs the source. Each new output directory contains separate full-timeline mono tracks plus `manifest.json` with hashes, processing settings, direction estimates and activity. Existing output directories are refused. Source WAV stays unchanged. Track 2 is emitted only when three consecutive analysis blocks support a distinct second direction; uncertain intervals are marked inactive. The two-track result is experimental and may contain bleed or track swaps. The active algorithm is normalized delay-and-sum after all-six-pair SRP-PHAT direction scoring. MVDR/LCMV remain research candidates, not shipped modes.
+Use `--source` to select `songbeam-4`, `sipeed-d80` or a local profile JSON. The layout chooses nominal raw channels; a device calibration JSON or explicit overrides record measured mapping, gains, polarities and fixed delays. Defaults are nominal and require physical verification. The input validator rejects malformed/inconsistent WAVs and unsupported formats; it never repairs the source. Each new output directory contains separate full-timeline mono tracks plus `manifest.json` with hashes, profile/layout/calibration settings, direction estimates and activity. Existing output directories are refused. Source WAV stays unchanged. An experimental second track can retain a brief distinct caller; it may contain bleed or track swaps. The active algorithm is normalized delay-and-sum after pairwise SRP-PHAT direction scoring. MVDR/LCMV remain research candidates, not shipped modes. See [processor details](processor/README.md) for direction conventions, constraints and Sipeed examples.
 
 The processor checks expected free space, reserves 8 GiB by default, checks while writing and uses partial files before finalization. It requires enough extra space for all requested output formats. Configure `--reserve-gib` only for a deliberate scratch test or a larger data drive; it is not a filesystem quota. A canceled run is marked canceled; a failed run is marked failed. `--resume` on a failed/canceled output verifies source hash, version and settings, then restarts the file into a new sibling directory while preserving the old attempt. Synthetic tests cover two sources, first/last WAV frames, codecs, failures and no-overwrite behavior. Field accuracy, channel mapping and recorder power-cycle behavior remain untested. See [processor details](processor/README.md), [SECURITY.md](SECURITY.md) and [the research review](docs/RESEARCH.md).
 

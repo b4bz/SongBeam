@@ -8,7 +8,7 @@ import math
 import os
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -17,17 +17,29 @@ from scipy.fft import next_fast_len
 
 from . import __version__
 from .audio import HALO, beam_fft, inspect, read_block
-from .localize import candidates, track_blocks
+from .calibration import load_calibration
+from .localize import track_blocks
+from .profiles import load_profile
+from .spatial import candidates, steering_samples
 
 
 @dataclass(frozen=True)
 class Settings:
-    channel_map: tuple[int, int, int, int]
+    channel_map: tuple[int, ...] | None = None
+    source_profile: str = "songbeam-4"
+    input_layout: str | None = None
+    calibration_file: str | None = None
+    calibration_sha256: str | None = None
     calibration_id: str = "unverified-board"
-    gains: tuple[float, float, float, float] = (1.0, 1.0, 1.0, 1.0)
-    polarities: tuple[int, int, int, int] = (1, 1, 1, 1)
-    fixed_delays_samples: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    orientation_deg: float | None = None
+    known_elevation_deg: float | None = None
+    source_sector: tuple[float, float] | None = None
+    gains: tuple[float, ...] | None = None
+    polarities: tuple[int, ...] | None = None
+    fixed_delays_samples: tuple[float, ...] | None = None
     manual_angles: tuple[float, ...] = ()
+    manual_azimuths: tuple[float, ...] = ()
+    manual_elevation: float = 0.0
     auto_beams: int = 1
     formats: tuple[str, ...] = ("flac",)
     wav_subtype: str = "PCM_24"
@@ -36,31 +48,82 @@ class Settings:
     mp3_vbr_quality: int | None = None
     flac_level: int = 5
     block_seconds: float = 0.5
+    analysis_window_seconds: float = 0.1
+    analysis_hop_seconds: float = 0.05
     fmin: float = 2000
     fmax: float = 8000
     reserve_gib: float = 8.0
     speed: float = 343.0
 
     def validate(self) -> None:
-        if sorted(self.channel_map) != [0, 1, 2, 3]:
-            raise ValueError("channel_map must be a permutation of 0,1,2,3")
+        profile = load_profile(self.source_profile)
+        n = len(profile.positions_m)
+        if self.channel_map is not None and (
+            len(self.channel_map) != n
+            or len(set(self.channel_map)) != n
+            or any(i < 0 or i >= 32 for i in self.channel_map)
+        ):
+            raise ValueError(
+                "channel_map must select distinct valid channels for the profile"
+            )
         if (
-            len(self.gains) != 4
-            or any(not math.isfinite(x) or x <= 0 or x > 4 for x in self.gains)
-            or len(self.polarities) != 4
-            or any(x not in (-1, 1) for x in self.polarities)
-            or len(self.fixed_delays_samples) != 4
-            or any(
-                not math.isfinite(x) or abs(x) > 32 for x in self.fixed_delays_samples
+            self.gains is not None
+            and (
+                len(self.gains) != n
+                or any(not math.isfinite(x) or x <= 0 or x > 4 for x in self.gains)
+            )
+            or self.polarities is not None
+            and (
+                len(self.polarities) != n
+                or any(x not in (-1, 1) for x in self.polarities)
+            )
+            or self.fixed_delays_samples is not None
+            and (
+                len(self.fixed_delays_samples) != n
+                or any(
+                    not math.isfinite(x) or abs(x) > 32
+                    for x in self.fixed_delays_samples
+                )
             )
         ):
             raise ValueError(
-                "calibration needs four bounded gain, polarity and delay values"
+                "calibration vectors must match selected microphones and be bounded"
             )
-        if self.auto_beams not in (1, 2) or self.manual_angles and self.auto_beams != 1:
+        if (
+            self.auto_beams not in (1, 2)
+            or (self.manual_angles or self.manual_azimuths)
+            and self.auto_beams != 1
+        ):
             raise ValueError("choose one/two automatic beams or manual angles")
+        if self.manual_angles and (profile.rank != 1 or self.manual_azimuths):
+            raise ValueError("manual-angle applies only to a linear array")
         if any(not math.isfinite(a) or abs(a) > 90 for a in self.manual_angles):
             raise ValueError("manual angles must be within ±90 degrees from broadside")
+        if (
+            any(not math.isfinite(a) or not 0 <= a < 360 for a in self.manual_azimuths)
+            or not math.isfinite(self.manual_elevation)
+            or abs(self.manual_elevation) > 90
+        ):
+            raise ValueError("manual source azimuth/elevation out of range")
+        if self.orientation_deg is not None and (
+            not math.isfinite(self.orientation_deg)
+            or not 0 <= self.orientation_deg < 360
+        ):
+            raise ValueError(
+                "orientation must be degrees clockwise from north for local +X"
+            )
+        if self.known_elevation_deg is not None and (
+            not math.isfinite(self.known_elevation_deg)
+            or abs(self.known_elevation_deg) > 90
+        ):
+            raise ValueError("known elevation must be within ±90 degrees")
+        if self.source_sector is not None and (
+            len(self.source_sector) != 2
+            or any(not math.isfinite(v) or not 0 <= v < 360 for v in self.source_sector)
+        ):
+            raise ValueError("source sector must contain two local azimuths in [0,360)")
+        if self.source_sector is not None and self.known_elevation_deg is None:
+            raise ValueError("source sector needs independently known elevation")
         if (
             not self.formats
             or set(self.formats) - {"wav", "flac", "mp3"}
@@ -79,6 +142,13 @@ class Settings:
             raise ValueError("MP3 VBR quality must be 0–9")
         if not 0.2 <= self.block_seconds <= 2 or not 0 <= self.fmin < self.fmax:
             raise ValueError("invalid analysis window or band")
+        if (
+            not 0.02
+            <= self.analysis_hop_seconds
+            <= self.analysis_window_seconds
+            <= self.block_seconds
+        ):
+            raise ValueError("analysis hop/window must fit processing block")
         if not 300 <= self.speed <= 370 or self.reserve_gib < 0:
             raise ValueError("invalid sound speed or reserve")
 
@@ -238,9 +308,16 @@ def _sha256(path: Path) -> str:
 
 
 def _calibrate(block: np.ndarray, settings: Settings) -> np.ndarray:
-    gains = np.asarray(settings.gains) * np.asarray(settings.polarities)
+    n = block.shape[1]
+    gains = np.asarray(
+        settings.gains if settings.gains is not None else (1.0,) * n
+    ) * np.asarray(settings.polarities if settings.polarities is not None else (1,) * n)
     output = block * gains[None, :]
-    shifts = np.asarray(settings.fixed_delays_samples)
+    shifts = np.asarray(
+        settings.fixed_delays_samples
+        if settings.fixed_delays_samples is not None
+        else (0.0,) * n
+    )
     if not np.any(shifts):
         return output.astype("float32")
     size = next_fast_len(len(output) + 2 * HALO)
@@ -297,6 +374,107 @@ def _resolve_output(input_path: Path, output: Path) -> tuple[Path, Path]:
     return source, parent / output.name
 
 
+def _annotate_direction(hit: dict, profile, settings: Settings) -> dict:
+    result = dict(hit)
+    if profile.rank == 1:
+        if settings.known_elevation_deg is None:
+            result["compatible_local_bearings_deg"] = None
+            return result
+        axis = np.linalg.svd(
+            np.asarray(profile.positions_m) - np.mean(profile.positions_m, axis=0),
+            full_matrices=False,
+        )[2][0]
+        if axis[np.argmax(abs(axis))] < 0:
+            axis = -axis
+        if abs(axis[2]) > 1e-6:
+            result["bearing_status"] = "linear_constraint_requires_horizontal_axis"
+            return result
+        horizontal = math.cos(math.radians(settings.known_elevation_deg))
+        ratio = -hit["u"] / horizontal if horizontal > 1e-6 else float("inf")
+        if abs(ratio) > 1.001:
+            result["bearing_status"] = "constraint_inconsistent"
+            result["compatible_local_bearings_deg"] = []
+            return result
+        axis_bearing = math.degrees(math.atan2(axis[1], axis[0]))
+        delta = math.degrees(math.acos(max(-1, min(1, ratio))))
+        bearings = sorted(
+            {round((axis_bearing + sign * delta) % 360, 2) for sign in (-1, 1)}
+        )
+        if settings.source_sector is not None:
+            start, end = settings.source_sector
+            bearings = [
+                b
+                for b in bearings
+                if (start <= b <= end if start <= end else b >= start or b <= end)
+            ]
+        result["compatible_local_bearings_deg"] = bearings
+        result["bearing_status"] = (
+            "constrained_unique_bearing"
+            if len(bearings) == 1
+            else "constraint_inconsistent"
+            if not bearings
+            else "constrained_ambiguous_bearing"
+        )
+        result["azimuth_deg"] = bearings[0] if len(bearings) == 1 else None
+    if settings.orientation_deg is not None and result.get("azimuth_deg") is not None:
+        result["compass_bearing_deg"] = round(
+            (settings.orientation_deg + result["azimuth_deg"]) % 360, 2
+        )
+    return result
+
+
+def _block_candidates(
+    block: np.ndarray, rate: int, profile, settings: Settings
+) -> list[dict]:
+    """Retain brief calls using overlapping short localization windows."""
+    window = max(256, round(rate * settings.analysis_window_seconds))
+    hop = max(128, round(rate * settings.analysis_hop_seconds))
+    clusters: list[dict] = []
+    for start in range(0, len(block), hop):
+        segment = block[start : start + window]
+        if len(segment) < window // 2:
+            break
+        for hit in candidates(
+            segment,
+            rate,
+            profile,
+            settings.auto_beams,
+            settings.fmin,
+            settings.fmax,
+            settings.speed,
+        ):
+            q = np.asarray(hit["direction_q"])
+            nearest = min(
+                clusters,
+                key=lambda old: np.linalg.norm(np.asarray(old["direction_q"]) - q),
+                default=None,
+            )
+            if (
+                nearest is None
+                or np.linalg.norm(np.asarray(nearest["direction_q"]) - q) > 0.24
+            ):
+                clusters.append(dict(hit, evidence_windows=1))
+            else:
+                nearest["evidence_windows"] += 1
+                if hit["score"] > nearest["score"]:
+                    nearest.update(hit)
+    clusters.sort(key=lambda hit: (hit["evidence_windows"], hit["score"]), reverse=True)
+    if clusters and clusters[0]["evidence_windows"] < 1:
+        return []
+    if settings.auto_beams > 1 and clusters:
+        first = clusters[0]
+        others = [
+            hit
+            for hit in clusters[1:]
+            if hit["evidence_windows"] >= 3 or hit["score"] >= 0.75 * first["score"]
+        ]
+        clusters = [first, *others]
+    return [
+        _annotate_direction(hit, profile, settings)
+        for hit in clusters[: settings.auto_beams]
+    ]
+
+
 def process(
     input_path: Path,
     output: Path,
@@ -305,38 +483,107 @@ def process(
     required_mount: Path | None = None,
 ) -> dict:
     settings.validate()
+    requested_settings = settings
+    profile = load_profile(settings.source_profile)
     source, destination = _resolve_output(input_path, output)
     _mount_guard(destination.parent, required_mount)
-    details = inspect(source, settings.channel_map)
+    raw_info = sf.info(str(source))
+    layout_name, layout_channels, nominal_map = profile.layout(
+        settings.input_layout, raw_info.channels
+    )
+    if settings.calibration_file is not None:
+        calibration = load_calibration(
+            Path(settings.calibration_file), profile, layout_name, raw_info.samplerate
+        )
+        if (
+            settings.channel_map is not None
+            or settings.gains is not None
+            or settings.polarities is not None
+            or settings.fixed_delays_samples is not None
+        ):
+            raise ValueError(
+                "Choose a calibration file or individual calibration overrides"
+            )
+        settings = replace(settings, **calibration)
+        settings.validate()
+    mapping = settings.channel_map if settings.channel_map is not None else nominal_map
+    if any(i >= layout_channels for i in mapping):
+        raise ValueError("Selected microphone channel exceeds input layout")
+    details = inspect(source, mapping, layout_channels)
     rate = int(details["sample_rate"])
+    if not profile.rate_range[0] <= rate <= profile.rate_range[1]:
+        raise ValueError("Sample rate outside profile range")
     frames = int(details["frames"])
     block_len = max(1024, round(settings.block_seconds * rate))
     count = math.ceil(frames / block_len)
+    positions = np.asarray(profile.positions_m)
+    aperture = float(
+        np.max(np.linalg.norm(positions[:, None, :] - positions[None, :, :], axis=2))
+    )
+    halo = max(HALO, math.ceil(aperture * rate / settings.speed) + 48)
     inferred: list[list[dict]] = []
     if settings.manual_angles:
+        axis = np.linalg.svd(
+            np.asarray(profile.positions_m) - np.mean(profile.positions_m, axis=0),
+            full_matrices=False,
+        )[2][0]
+        if axis[np.argmax(abs(axis))] < 0:
+            axis = -axis
         tracks = [
             [
-                {"u": round(float(math.sin(math.radians(angle))), 3), "score": None}
+                {
+                    "u": round(float(math.sin(math.radians(angle))), 3),
+                    "direction_q": (axis * math.sin(math.radians(angle))).tolist(),
+                    "score": None,
+                    "bearing_status": "ambiguous_linear_projection",
+                    "azimuth_deg": None,
+                }
                 for _ in range(count)
             ]
             for angle in settings.manual_angles
         ]
+    elif settings.manual_azimuths:
+        tracks = []
+        for azimuth in settings.manual_azimuths:
+            a, e = math.radians(azimuth), math.radians(settings.manual_elevation)
+            q = [-math.cos(e) * math.cos(a), -math.cos(e) * math.sin(a), -math.sin(e)]
+            entry = {
+                "direction_q": q,
+                "score": None,
+                "azimuth_deg": azimuth,
+                "bearing_status": "manually_selected",
+            }
+            if profile.rank == 1:
+                axis = np.linalg.svd(
+                    np.asarray(profile.positions_m)
+                    - np.mean(profile.positions_m, axis=0),
+                    full_matrices=False,
+                )[2][0]
+                if axis[np.argmax(abs(axis))] < 0:
+                    axis = -axis
+                entry["u"] = float(np.dot(q, axis))
+            tracks.append([entry.copy() for _ in range(count)])
     else:
         with sf.SoundFile(str(source)) as stream:
-            while True:
-                block = stream.read(block_len, dtype="float32", always_2d=True)
-                if not len(block):
-                    break
+            for index in range(count):
+                start = index * block_len
+                length = min(block_len, frames - start)
+                block, first = read_block(stream, start, length, mapping, halo=halo)
+                calibrated = _calibrate(block, settings)
                 inferred.append(
-                    candidates(
-                        _calibrate(block[:, settings.channel_map], settings),
+                    _block_candidates(
+                        calibrated[start - first : start - first + length],
                         rate,
-                        settings.auto_beams,
-                        settings.fmin,
-                        settings.fmax,
+                        profile,
+                        settings,
                     )
                 )
         tracks = track_blocks(inferred, settings.auto_beams)
+    if settings.manual_angles or settings.manual_azimuths:
+        tracks = [
+            [_annotate_direction(hit, profile, settings) for hit in row]
+            for row in tracks
+        ]
     _space_guard(
         destination.parent,
         _space_required(frames, len(tracks), rate, settings),
@@ -344,22 +591,36 @@ def process(
     )
     destination.mkdir(mode=0o750)
     manifest = {
-        "schema": 1,
+        "schema": 2,
         "status": "running",
         "processor_version": __version__,
         "source": details,
         "calibration_id": settings.calibration_id,
-        "geometry_m": [0, 0.045, 0.075, 0.12],
-        "direction_convention": "degrees from array broadside; equal projection is ambiguous",
+        "profile": profile.as_dict(),
+        "profile_sha256": profile.sha256,
+        "input_layout": layout_name,
+        "selected_raw_channels": list(mapping),
+        "calibration_status": "unverified"
+        if settings.calibration_id == "unverified-board"
+        else "supplied-unverified",
+        "calibration_sha256": settings.calibration_sha256,
+        "geometry_m": [list(p) for p in profile.positions_m],
+        "direction_convention": "q points toward later arrivals; source vector is -q; local XY azimuth from +X; linear direction has rotational ambiguity",
         "settings": {
             key: list(value) if isinstance(value, tuple) else value
             for key, value in vars(settings).items()
         },
+        "request_settings": {
+            key: list(value) if isinstance(value, tuple) else value
+            for key, value in vars(requested_settings).items()
+        },
         "block_frames": block_len,
+        "analysis_window_frames": round(rate * settings.analysis_window_seconds),
+        "analysis_hop_frames": round(rate * settings.analysis_hop_seconds),
         "tracks": [],
         "outputs": {},
         "output_diagnostics": {},
-        "gain_policy": "equal_four_channel_weights_no_automatic_gain",
+        "gain_policy": "equal_selected_channel_weights_no_automatic_gain",
         "pcm_dither": "deterministic_TPDF_at_target_bit_depth",
     }
     if retry_of is not None:
@@ -371,18 +632,21 @@ def process(
             OutputSet(destination, i + 1, rate, frames, settings)
             for i in range(len(tracks))
         ]
-        previous = [0.0] * len(tracks)
+        previous = [np.zeros(3) for _ in tracks]
         with sf.SoundFile(str(source)) as stream:
             for index in range(count):
                 start = index * block_len
                 length = min(block_len, frames - start)
-                block, first = read_block(stream, start, length, settings.channel_map)
+                block, first = read_block(stream, start, length, mapping, halo=halo)
                 block = _calibrate(block, settings)
                 fft_len = next_fast_len(len(block) + 2 * HALO)
                 spectrum = np.fft.rfft(block, n=fft_len, axis=0)
                 for track_id, writer in enumerate(writers):
                     hit = tracks[track_id][index]
-                    u = hit["u"] if hit is not None else previous[track_id]
+                    q = np.asarray(
+                        hit["direction_q"] if hit is not None else previous[track_id],
+                        dtype=float,
+                    )
                     if track_id > 0 and hit is None:
                         audio = np.zeros(length, dtype="float32")
                     else:
@@ -392,14 +656,15 @@ def process(
                             start,
                             length,
                             rate,
-                            u,
+                            0.0,
                             settings.speed,
                             spectrum,
+                            steering_samples(profile, q, rate, settings.speed),
                         )
                         if (
                             index
                             and hit is not None
-                            and abs(u - previous[track_id]) > 0.01
+                            and np.linalg.norm(q - previous[track_id]) > 0.01
                         ):
                             fade_len = min(length, round(0.02 * rate))
                             old = beam_fft(
@@ -408,9 +673,12 @@ def process(
                                 start,
                                 length,
                                 rate,
-                                previous[track_id],
+                                0.0,
                                 settings.speed,
                                 spectrum,
+                                steering_samples(
+                                    profile, previous[track_id], rate, settings.speed
+                                ),
                             )
                             blend = np.linspace(0, 1, fade_len, dtype="float32")
                             audio[:fade_len] = (
@@ -419,13 +687,35 @@ def process(
                     if np.max(np.abs(audio)) > 1.00001:
                         raise ValueError("Beam clipping; use a calibrated lower gain")
                     writer.write(audio)
-                    previous[track_id] = u
+                    previous[track_id] = q
                     manifest["tracks"].append(
                         {
                             "track": track_id + 1,
                             "start_sample": start,
                             "frames": length,
-                            "u": u,
+                            "u": hit.get("u") if hit else None,
+                            "direction_q": q.tolist(),
+                            "azimuth_deg": hit.get("azimuth_deg") if hit else None,
+                            "bearing_status": hit.get("bearing_status")
+                            if hit
+                            else "no_evidence",
+                            "compatible_local_bearings_deg": hit.get(
+                                "compatible_local_bearings_deg"
+                            )
+                            if hit
+                            else None,
+                            "compass_bearing_deg": hit.get("compass_bearing_deg")
+                            if hit
+                            else None,
+                            "absolute_elevation_deg": hit.get("absolute_elevation_deg")
+                            if hit
+                            else None,
+                            "angle_from_array_plane_magnitude_deg": hit.get(
+                                "angle_from_array_plane_magnitude_deg"
+                            )
+                            if hit
+                            else None,
+                            "elevation_deg": hit.get("elevation_deg") if hit else None,
                             "active": hit is not None,
                             "score": hit["score"] if hit else None,
                         }

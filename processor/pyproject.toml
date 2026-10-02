@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "songbeam-processor"
-version = "0.1.1"
-description = "Bounded offline directional processing for four-channel SongBeam audio"
+version = "0.2.0"
+description = "Profiled offline directional processing for SongBeam and microphone arrays"
 requires-python = ">=3.11"
 dependencies = ["numpy>=2.0,<3", "scipy>=1.13,<2", "soundfile>=0.12,<1"]
 

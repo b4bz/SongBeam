@@ -86,18 +86,33 @@ def candidates(
 def track_blocks(
     block_candidates: list[list[dict]], max_tracks: int = 2
 ) -> list[list[dict | None]]:
-    """Keep identities by nearest direction, requiring persistence for a second track."""
+    """Associate directions with expiry; retain strong brief second callers."""
     tracks: list[list[dict | None]] = [
         [None for _ in block_candidates] for _ in range(max_tracks)
     ]
-    previous: list[float | None] = [None] * max_tracks
+    previous: list[np.ndarray | None] = [None] * max_tracks
+    misses = [0] * max_tracks
+
+    def vector(candidate: dict) -> np.ndarray:
+        return np.asarray(
+            candidate["direction_q"]
+            if "direction_q" in candidate
+            else [candidate["u"]],
+            dtype=float,
+        )
+
     for time_index, found in enumerate(block_candidates):
         remaining = list(found)
         for track_id, old in enumerate(previous):
+            if old is not None and misses[track_id] >= 1:
+                previous[track_id] = None
+        for track_id, old in enumerate(previous):
             if old is None or not remaining:
                 continue
-            nearest = min(remaining, key=lambda item: abs(item["u"] - old))
-            if abs(nearest["u"] - old) <= 0.35:
+            nearest = min(
+                remaining, key=lambda item: np.linalg.norm(vector(item) - old)
+            )
+            if np.linalg.norm(vector(nearest) - old) <= 0.35:
                 tracks[track_id][time_index] = nearest
                 remaining.remove(nearest)
         for track_id in range(max_tracks):
@@ -109,11 +124,25 @@ def track_blocks(
         for track_id in range(max_tracks):
             hit = tracks[track_id][time_index]
             if hit is not None:
-                previous[track_id] = hit["u"]
+                previous[track_id] = vector(hit)
+                misses[track_id] = 0
+            else:
+                misses[track_id] += 1
     if max_tracks > 1:
-        # A second output requires at least three adjacent blocks with evidence.
+        # One strong distinct block can be a real short bird call. Weak isolated
+        # sidelobes need persistence. No claim of a separate individual follows.
         present = [entry is not None for entry in tracks[1]]
-        has_run = any(all(present[i : i + 3]) for i in range(max(0, len(present) - 2)))
-        if not has_run:
+        persistent = any(
+            all(present[i : i + 2]) for i in range(max(0, len(present) - 1))
+        )
+        strong = any(
+            entry is not None
+            and entry.get("score") is not None
+            and tracks[0][i] is not None
+            and tracks[0][i].get("score") is not None
+            and entry["score"] >= 0.75 * tracks[0][i]["score"]
+            for i, entry in enumerate(tracks[1])
+        )
+        if not (persistent or strong):
             return tracks[:1]
     return tracks

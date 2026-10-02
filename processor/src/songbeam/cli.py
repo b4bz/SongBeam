@@ -15,64 +15,92 @@ import soundfile as sf
 
 from . import __version__
 from .audio import inspect, sha256_file
+from .calibration import load_calibration
 from .process import Settings, _mount_guard, process
+from .profiles import BUILTINS, load_profile
 
 
-def _mapping(value: str) -> tuple[int, int, int, int]:
+def _mapping(value: str) -> tuple[int, ...]:
     try:
         result = tuple(int(part.strip()) for part in value.split(","))
     except ValueError as error:
         raise argparse.ArgumentTypeError(
-            "channel map must be four comma-separated indices"
+            "channel map must be comma-separated indices"
         ) from error
-    if sorted(result) != [0, 1, 2, 3]:
-        raise argparse.ArgumentTypeError("channel map must permute 0,1,2,3")
-    return result  # type: ignore[return-value]
+    if (
+        not 2 <= len(result) <= 16
+        or len(set(result)) != len(result)
+        or any(i < 0 or i >= 32 for i in result)
+    ):
+        raise argparse.ArgumentTypeError(
+            "channel map must select 2–16 distinct valid indices"
+        )
+    return result
 
 
-def _quad_floats(value: str) -> tuple[float, float, float, float]:
+def _quad_floats(value: str) -> tuple[float, ...]:
     try:
         result = tuple(float(part.strip()) for part in value.split(","))
     except ValueError as error:
-        raise argparse.ArgumentTypeError(
-            "expected four comma-separated numbers"
-        ) from error
-    if len(result) != 4:
-        raise argparse.ArgumentTypeError("expected four comma-separated numbers")
-    return result  # type: ignore[return-value]
+        raise argparse.ArgumentTypeError("expected comma-separated numbers") from error
+    if not 2 <= len(result) <= 16:
+        raise argparse.ArgumentTypeError("expected 2–16 comma-separated numbers")
+    return result
 
 
-def _quad_polarities(value: str) -> tuple[int, int, int, int]:
+def _quad_polarities(value: str) -> tuple[int, ...]:
     try:
         result = tuple(int(part.strip()) for part in value.split(","))
     except ValueError as error:
-        raise argparse.ArgumentTypeError("expected four +1 or -1 values") from error
-    if len(result) != 4 or any(x not in (-1, 1) for x in result):
-        raise argparse.ArgumentTypeError("expected four +1 or -1 values")
-    return result  # type: ignore[return-value]
+        raise argparse.ArgumentTypeError("expected +1 or -1 values") from error
+    if not 2 <= len(result) <= 16 or any(x not in (-1, 1) for x in result):
+        raise argparse.ArgumentTypeError("expected 2–16 +1 or -1 values")
+    return result
 
 
 def parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        prog="songbeam", description="Validate and process four-channel SongBeam WAVs"
+        prog="songbeam", description="Validate and process profiled microphone arrays"
     )
     sub = p.add_subparsers(dest="command", required=True)
+    profiles_cmd = sub.add_parser(
+        "profiles", help="list or inspect microphone profiles"
+    )
+    profiles_cmd.add_argument("action", choices=("list", "show"))
+    profiles_cmd.add_argument(
+        "profile", nargs="?", help="built-in ID or local JSON file for show"
+    )
     inspect_cmd = sub.add_parser(
         "inspect", help="validate recording and report channels"
     )
     inspect_cmd.add_argument("input", type=Path)
-    inspect_cmd.add_argument("--channel-map", type=_mapping, required=True)
+    inspect_cmd.add_argument("--channel-map", type=_mapping)
+    inspect_cmd.add_argument("--source", default="songbeam-4")
+    inspect_cmd.add_argument("--input-layout")
+    inspect_cmd.add_argument("--calibration", type=Path)
     run = sub.add_parser("process", help="export directional mono audio")
     run.add_argument("input", type=Path)
     run.add_argument("--output", type=Path, required=True)
-    run.add_argument("--channel-map", type=_mapping, required=True)
+    run.add_argument("--channel-map", type=_mapping)
+    run.add_argument("--source", default="songbeam-4")
+    run.add_argument("--input-layout")
+    run.add_argument("--calibration", type=Path, help="local device calibration JSON")
     run.add_argument("--calibration-id", default="unverified-board")
-    run.add_argument("--gains", type=_quad_floats, default=(1.0, 1.0, 1.0, 1.0))
-    run.add_argument("--polarities", type=_quad_polarities, default=(1, 1, 1, 1))
     run.add_argument(
-        "--fixed-delays-samples", type=_quad_floats, default=(0.0, 0.0, 0.0, 0.0)
+        "--orientation-deg", type=float, help="compass bearing of local +X"
     )
+    run.add_argument("--known-elevation-deg", type=float)
+    run.add_argument(
+        "--source-sector",
+        type=_quad_floats,
+        help="local bearing start,end (with known elevation)",
+    )
+    run.add_argument("--gains", type=_quad_floats)
+    run.add_argument("--polarities", type=_quad_polarities)
+    run.add_argument("--fixed-delays-samples", type=_quad_floats)
     run.add_argument("--manual-angle", type=float, action="append", default=[])
+    run.add_argument("--manual-azimuth", type=float, action="append", default=[])
+    run.add_argument("--manual-elevation", type=float, default=0.0)
     run.add_argument("--auto-beams", type=int, choices=(1, 2), default=1)
     run.add_argument(
         "--format", action="append", choices=("wav", "flac", "mp3"), default=[]
@@ -87,6 +115,8 @@ def parser() -> argparse.ArgumentParser:
     run.add_argument("--fmin", type=float, default=2000)
     run.add_argument("--fmax", type=float, default=8000)
     run.add_argument("--block-seconds", type=float, default=0.5)
+    run.add_argument("--analysis-window-seconds", type=float, default=0.1)
+    run.add_argument("--analysis-hop-seconds", type=float, default=0.05)
     run.add_argument("--reserve-gib", type=float, default=8)
     run.add_argument(
         "--require-mount",
@@ -298,7 +328,16 @@ def retry_destination(prior: Path, source: Path, settings: Settings) -> Path:
         record.get("status") not in {"failed", "canceled"}
         or record.get("source", {}).get("source_sha256") != sha256_file(source)
         or record.get("processor_version") != __version__
-        or record.get("settings") != expected
+        or record.get("request_settings", record.get("settings")) != expected
+        or (
+            record.get("profile_sha256") is not None
+            and record["profile_sha256"] != load_profile(settings.source_profile).sha256
+        )
+        or (
+            settings.calibration_file is not None
+            and record.get("calibration_sha256")
+            != sha256_file(Path(settings.calibration_file))
+        )
     ):
         raise ValueError("prior job status, source hash, version or settings differ")
     for suffix in range(1, 100):
@@ -311,16 +350,63 @@ def retry_destination(prior: Path, source: Path, settings: Settings) -> Path:
 def main() -> int:
     args = parser().parse_args()
     try:
-        if args.command == "inspect":
-            result = inspect(args.input, args.channel_map)
+        if args.command == "profiles":
+            if args.action == "list":
+                result = [p.as_dict() for p in BUILTINS.values()]
+            else:
+                if not args.profile:
+                    raise ValueError("profiles show requires an ID or local JSON path")
+                result = load_profile(args.profile).as_dict()
+        elif args.command == "inspect":
+            profile = load_profile(args.source)
+            info = sf.info(args.input)
+            layout, channels, nominal = profile.layout(args.input_layout, info.channels)
+            calibration = (
+                load_calibration(args.calibration, profile, layout, info.samplerate)
+                if args.calibration
+                else None
+            )
+            if calibration and args.channel_map is not None:
+                raise ValueError("Choose calibration file or explicit channel map")
+            mapping = (
+                calibration["channel_map"]
+                if calibration
+                else args.channel_map
+                if args.channel_map is not None
+                else nominal
+            )
+            if len(mapping) != len(profile.positions_m) or any(
+                i >= channels for i in mapping
+            ):
+                raise ValueError("channel map conflicts with selected profile/layout")
+            result = inspect(args.input, mapping, channels)
+            result.update(
+                profile=profile.as_dict(),
+                profile_sha256=profile.sha256,
+                input_layout=layout,
+                calibration_status="supplied-unverified"
+                if calibration
+                else "unverified",
+                calibration_sha256=calibration["calibration_sha256"]
+                if calibration
+                else None,
+            )
         elif args.command == "process":
             settings = Settings(
                 channel_map=args.channel_map,
+                source_profile=args.source,
+                input_layout=args.input_layout,
+                calibration_file=str(args.calibration) if args.calibration else None,
                 calibration_id=args.calibration_id,
+                orientation_deg=args.orientation_deg,
+                known_elevation_deg=args.known_elevation_deg,
+                source_sector=tuple(args.source_sector) if args.source_sector else None,
                 gains=args.gains,
                 polarities=args.polarities,
                 fixed_delays_samples=args.fixed_delays_samples,
                 manual_angles=tuple(args.manual_angle),
+                manual_azimuths=tuple(args.manual_azimuth),
+                manual_elevation=args.manual_elevation,
                 auto_beams=args.auto_beams,
                 formats=tuple(args.format or ["flac"]),
                 wav_subtype=args.wav_subtype,
@@ -331,6 +417,8 @@ def main() -> int:
                 fmin=args.fmin,
                 fmax=args.fmax,
                 block_seconds=args.block_seconds,
+                analysis_window_seconds=args.analysis_window_seconds,
+                analysis_hop_seconds=args.analysis_hop_seconds,
                 reserve_gib=args.reserve_gib,
             )
             destination = (
