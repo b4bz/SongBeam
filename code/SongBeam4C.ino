@@ -6,6 +6,8 @@
 #include <Wire.h>
 #include <TimeLib.h>
 #include <TimeAlarms.h>
+#include <string.h>
+#include "WavFormat.h"
 
 extern "C" uint32_t set_arm_clock(uint32_t frequency);
 
@@ -25,7 +27,6 @@ unsigned int blockAlign = numChannels*bitsPerSample/8;
 unsigned long Subchunk2Size = 0L;
 unsigned long recByteSaved = 0L;
 unsigned long NumSamples = 0L;
-byte byte1, byte2, byte3, byte4;
 
 AudioInputI2S            audioInput;
 AudioRecordQueue         queue1;
@@ -52,7 +53,8 @@ int recDay[7]={1,1,1,1,1,1,1};
 
 int mode = 0;  // 0=stopped, 1=recording, 2=playing
 FsFile frec;
-File frec2;
+bool recordingFailed = false;
+int maxQueueDepth = 0;
 elapsedMillis  msecs;
 
 int filecount=0;
@@ -117,6 +119,13 @@ void setup() {
   }
   Serial.println("reading config file");
   readconfig();
+  if (numChannels != 2 && numChannels != 4) numChannels = 4;
+  if (recmins < 1 || recmins > 120) recmins = 15;
+  if (recordPeriodMins < 1 || recordPeriodMins > 1440) recordPeriodMins = 180;
+  if (starttimehour < 0 || starttimehour > 23) starttimehour = 7;
+  if (starttimemin < 0 || starttimemin > 59) starttimemin = 0;
+  blockAlign = numChannels * (bitsPerSample / 8);
+  byteRate = sampleRate * blockAlign;
 
   if (numChannels==2){
     PIN_POWER=32;
@@ -124,11 +133,16 @@ void setup() {
   
   pinMode(PIN_POWER, OUTPUT);
   digitalWrite(PIN_POWER, LOW);
+  if (year() < 2020 || year() > 2100) {
+    Serial.println("Invalid RTC: recording disabled");
+    digitalWrite(PIN_POWER, HIGH);
+    while (1) delay(1000);
+  }
 
   Serial.println(devname);
   Serial.println(starttimemin);
   Serial.println(starttimehour);
-  Serial.println(recmins);\
+  Serial.println(recmins);
   Serial.println(recordPeriodMins);
   Serial.println(numChannels);
   for (int i=0; i<7; i++){Serial.println(recDay[i]);}
@@ -229,7 +243,7 @@ void loop() {
   }
 }
 
-void recordSimple(int ts){
+void recordSimple(unsigned long ts){
   //set_arm_clock(hiclock);
   delay(500);
   //Serial.println("Recording ");
@@ -237,135 +251,92 @@ void recordSimple(int ts){
   elapsedMillis recordingTime = 0;
   if (numChannels==2){
     char* fn=startRecording2Chan();
-    while(recordingTime<ts) continueRecording2Chan();
+    while(recordingTime<ts && !recordingFailed && mode == 1) continueRecording2Chan();
     stopRecording2Chan(fn);
   }
   else{
     char* fn=startRecording();  
-    while(recordingTime<ts) continueRecording();
+    while(recordingTime<ts && !recordingFailed && mode == 1) continueRecording();
     stopRecording(fn);
   }
   delay(1000);
 }
 
 
-char* startRecording() {
-  Serial.println("startRecording");
-  filecount++;
-
-  char *filename = makeFilename();
-
-  if (SD.exists(filename)) {
-    SD.remove(filename);
+char* startRecordingChannels(unsigned int channels) {
+  static char filename[48];
+  const char* base = makeFilename();
+  size_t stemLength = strlen(base) - strlen(postfix);
+  recordingFailed = false;
+  mode = 0;
+  for (unsigned int suffix = 0; suffix < 100; suffix++) {
+    if (suffix == 0) snprintf(filename, sizeof(filename), "%s", base);
+    else snprintf(filename, sizeof(filename), "%.*s_%02u%s", (int)stemLength, base, suffix, postfix);
+    if (!SD.exists(filename)) break;
+    if (suffix == 99) { Serial.println("No unique recording filename"); recordingFailed = true; return nullptr; }
   }
-  frec = SD.sdfs.open(filename, O_WRITE | O_CREAT);
-  int FILE_SIZE=4*60*recmins*44100*2*2;
-
-  if (!frec.preAllocate(FILE_SIZE)) {
-     Serial.println("preAllocate failed\n");
-     
+  frec = SD.sdfs.open(filename, O_RDWR | O_CREAT | O_EXCL);
+  if (!frec) { Serial.println("Recording open failed"); recordingFailed = true; return nullptr; }
+  const uint64_t expected = 44ULL + (uint64_t)channels * 2ULL * sampleRate * 60ULL * (uint64_t)recmins;
+  if (expected > 0xFFFFFFFFULL || !frec.preAllocate(expected) || !frec.seek(0)) {
+    Serial.println("Recording allocation failed");
+    frec.close();
+    recordingFailed = true;
+    return nullptr;
   }
-  //Serial.print("File opened ");
-  //Serial.println(now());
-  
-  if (frec) {
-    queue1.begin();
-    queue2.begin();
-    queue1a.begin();
-    queue2a.begin();
-    mode = 1;
-    recByteSaved = 0L;
+  byte header[44] = {0};
+  if (frec.write(header, sizeof(header)) != sizeof(header)) {
+    Serial.println("WAV header reserve failed");
+    frec.close();
+    recordingFailed = true;
+    return nullptr;
   }
-
+  queue1.begin(); queue2.begin();
+  if (channels == 4) { queue1a.begin(); queue2a.begin(); }
+  mode = 1;
+  recByteSaved = 0;
+  maxQueueDepth = 0;
   return filename;
 }
 
-char* startRecording2Chan() {
-  Serial.println("startRecording");
-  filecount++;
+char* startRecording() { return startRecordingChannels(4); }
+char* startRecording2Chan() { return startRecordingChannels(2); }
 
-  char *filename = makeFilename();
-
-  if (SD.exists(filename)) {
-    SD.remove(filename);
+void writeInterleavedBlock(unsigned int channels) {
+  byte block[1024];
+  memcpy(bufferL, queue1.readBuffer(), 256); queue1.freeBuffer();
+  memcpy(bufferR, queue2.readBuffer(), 256); queue2.freeBuffer();
+  if (channels == 4) {
+    memcpy(bufferLa, queue1a.readBuffer(), 256); queue1a.freeBuffer();
+    memcpy(bufferRa, queue2a.readBuffer(), 256); queue2a.freeBuffer();
   }
-  frec = SD.sdfs.open(filename, O_WRITE | O_CREAT);
-  int FILE_SIZE=2*60*recmins*44100*2*2;
-
-  if (!frec.preAllocate(FILE_SIZE)) {
-     Serial.println("preAllocate failed\n");
-     
-  }
-  //Serial.print("File opened ");
-  //Serial.println(now());
-  
-  if (frec) {
-    queue1.begin();
-    queue2.begin();
-    mode = 1;
-    recByteSaved = 0L;
-  }
-
-  return filename;
+  const uint8_t* inputs[4] = {bufferL, bufferR, bufferLa, bufferRa};
+  songbeam::interleave128(inputs, channels, block);
+  const size_t wanted = 128U * channels * 2U;
+  const size_t written = frec.write(block, wanted);
+  recByteSaved += written - written % (channels * 2U);
+  if (written != wanted) { recordingFailed = true; Serial.println("Short SD audio write"); }
 }
 
 void continueRecording() {
 
-  if (queue1.available() >= 2 && queue2.available() >= 2 && queue1a.available() >=2 && queue2a.available() >=2) {
-    byte buffer[1024];
+  if (queue1.available() > maxQueueDepth) maxQueueDepth = queue1.available();
+  if (queue2.available() > maxQueueDepth) maxQueueDepth = queue2.available();
+  if (queue1a.available() > maxQueueDepth) maxQueueDepth = queue1a.available();
+  if (queue2a.available() > maxQueueDepth) maxQueueDepth = queue2a.available();
 
-    memcpy(bufferL, queue1.readBuffer(), 256);
-    memcpy(bufferR, queue2.readBuffer(), 256);
-    memcpy(bufferLa, queue1a.readBuffer(), 256);
-    memcpy(bufferRa, queue2a.readBuffer(), 256);
-    queue1.freeBuffer();
-    queue2.freeBuffer();
-    queue1a.freeBuffer();
-    queue2a.freeBuffer();
-    int b = 0;
-    for (int i = 0; i < 1024; i += 8) {
-      buffer[i] = bufferL[b];
-      buffer[i + 1] = bufferL[b + 1];
-      buffer[i + 2] = bufferR[b];
-      buffer[i + 3] = bufferR[b + 1];
-      buffer[i+4] = bufferLa[b];
-      buffer[i + 5] = bufferLa[b + 1];
-      buffer[i + 6] = bufferRa[b];
-      buffer[i + 7] = bufferRa[b + 1];
-      b = b+2;
-    }
-    //elapsedMicros usec = 0;
-    frec.write(buffer, 1024);  //256 or 512 (dudes code)
-    recByteSaved += 1024;
-    ////Serial.print("SD write, us=");
-    ////Serial.println(usec);
+  if (queue1.available() >= 2 && queue2.available() >= 2 && queue1a.available() >=2 && queue2a.available() >=2) {
+    writeInterleavedBlock(4);
   } 
 }
 
 void continueRecording2Chan() {
 
+  if (queue1.available() > maxQueueDepth) maxQueueDepth = queue1.available();
+  if (queue2.available() > maxQueueDepth) maxQueueDepth = queue2.available();
+
   if (queue1.available() >= 2 && queue2.available() >= 2) {
-    byte buffer[512];
-
-    memcpy(bufferL, queue1.readBuffer(), 256);
-    memcpy(bufferR, queue2.readBuffer(), 256);
-    
-    queue1.freeBuffer();
-    queue2.freeBuffer();
-
-    int b = 0;
-    for (int i = 0; i < 512; i += 4) {
-      buffer[i] = bufferL[b];
-      buffer[i + 1] = bufferL[b + 1];
-      buffer[i + 2] = bufferR[b];
-      buffer[i + 3] = bufferR[b + 1];
-      b = b+2;
-    }
-    //elapsedMicros usec = 0;
-    frec.write(buffer, 512);  //256 or 512 (dudes code)
-    recByteSaved += 512;
-    ////Serial.print("SD write, us=");
-    ////Serial.println(usec);
+    writeInterleavedBlock(2);
   } 
 }
 
@@ -377,27 +348,14 @@ void stopRecording(char* fn) {
   queue1a.end();
   queue2a.end();
   if (mode == 1) {
-    while (queue1.available() > 0 && queue2.available() > 0 && queue1a.available() > 0 && queue2a.available() > 0) {
-      frec.write((byte*)queue1.readBuffer(), 256);
-      queue1.freeBuffer();
-      frec.write((byte*)queue2.readBuffer(), 256);
-      queue2.freeBuffer();
-      frec.write((byte*)queue1a.readBuffer(), 256);
-      queue1a.freeBuffer();
-      frec.write((byte*)queue2a.readBuffer(), 256);
-      queue2a.freeBuffer();
-      recByteSaved += 256;
-    }
-    frec.truncate();
+    while (!recordingFailed && queue1.available() > 0 && queue2.available() > 0 && queue1a.available() > 0 && queue2a.available() > 0) writeInterleavedBlock(4);
+    if (queue1.available() || queue2.available() || queue1a.available() || queue2a.available()) recordingFailed = true;
+    if (!frec.seek(44ULL + recByteSaved) || !frec.truncate()) recordingFailed = true;
+    if (!writeOutHeader() || !frec.sync()) recordingFailed = true;
     frec.close();
-    delay(100);
-
-
-    frec2 = SD.open(fn, FILE_WRITE);
-    //frec = SD.sdfs.open(fn, O_WRITE | O_CREAT);
-    
-    writeOutHeader();
-    frec2.close();
+    if (recordingFailed) Serial.println("Recording incomplete: inspect WAV before processing");
+    Serial.print("Max audio memory blocks: "); Serial.println(AudioMemoryUsageMax());
+    Serial.print("Max queue depth: "); Serial.println(maxQueueDepth);
   }
   mode = 0;
   //Serial.print("finishedRecording ");
@@ -410,23 +368,14 @@ void stopRecording2Chan(char* fn) {
   queue1.end();
   queue2.end();
   if (mode == 1) {
-    while (queue1.available() > 0 && queue2.available() > 0) {
-      frec.write((byte*)queue1.readBuffer(), 256);
-      queue1.freeBuffer();
-      frec.write((byte*)queue2.readBuffer(), 256);
-      queue2.freeBuffer();
-      recByteSaved += 256;
-    }
-    frec.truncate();
+    while (!recordingFailed && queue1.available() > 0 && queue2.available() > 0) writeInterleavedBlock(2);
+    if (queue1.available() || queue2.available()) recordingFailed = true;
+    if (!frec.seek(44ULL + recByteSaved) || !frec.truncate()) recordingFailed = true;
+    if (!writeOutHeader() || !frec.sync()) recordingFailed = true;
     frec.close();
-    delay(100);
-
-
-    frec2 = SD.open(fn, FILE_WRITE);
-    //frec = SD.sdfs.open(fn, O_WRITE | O_CREAT);
-    
-    writeOutHeader();
-    frec2.close();
+    if (recordingFailed) Serial.println("Recording incomplete: inspect WAV before processing");
+    Serial.print("Max audio memory blocks: "); Serial.println(AudioMemoryUsageMax());
+    Serial.print("Max queue depth: "); Serial.println(maxQueueDepth);
   }
   mode = 0;
   //Serial.print("finishedRecording ");
@@ -434,111 +383,21 @@ void stopRecording2Chan(char* fn) {
 }
 
 
-void writeOutHeader() { // update WAV header with final filesize/datasize
-
-//  NumSamples = (recByteSaved*8)/bitsPerSample/numChannels;
-//  Subchunk2Size = NumSamples*numChannels*bitsPerSample/8; // number of samples x number of channels x number of bytes per sample
-  Subchunk2Size = recByteSaved;
-  ChunkSize = Subchunk2Size + 36;
-  frec2.seek(0);
-  frec2.write("RIFF");
-  byte1 = ChunkSize & 0xff;
-  byte2 = (ChunkSize >> 8) & 0xff;
-  byte3 = (ChunkSize >> 16) & 0xff;
-  byte4 = (ChunkSize >> 24) & 0xff;  
-  frec2.write(byte1);  frec2.write(byte2);  frec2.write(byte3);  frec2.write(byte4);
-  frec2.write("WAVE");
-  frec2.write("fmt ");
-  byte1 = Subchunk1Size & 0xff;
-  byte2 = (Subchunk1Size >> 8) & 0xff;
-  byte3 = (Subchunk1Size >> 16) & 0xff;
-  byte4 = (Subchunk1Size >> 24) & 0xff;  
-  frec2.write(byte1);  frec2.write(byte2);  frec2.write(byte3);  frec2.write(byte4);
-  byte1 = AudioFormat & 0xff;
-  byte2 = (AudioFormat >> 8) & 0xff;
-  frec2.write(byte1);  frec2.write(byte2); 
-  byte1 = numChannels & 0xff;
-  byte2 = (numChannels >> 8) & 0xff;
-  frec2.write(byte1);  frec2.write(byte2); 
-  byte1 = sampleRate & 0xff;
-  byte2 = (sampleRate >> 8) & 0xff;
-  byte3 = (sampleRate >> 16) & 0xff;
-  byte4 = (sampleRate >> 24) & 0xff;  
-  frec2.write(byte1);  frec2.write(byte2);  frec2.write(byte3);  frec2.write(byte4);
-  byte1 = byteRate & 0xff;
-  byte2 = (byteRate >> 8) & 0xff;
-  byte3 = (byteRate >> 16) & 0xff;
-  byte4 = (byteRate >> 24) & 0xff;  
-  frec2.write(byte1);  frec2.write(byte2);  frec2.write(byte3);  frec2.write(byte4);
-  byte1 = blockAlign & 0xff;
-  byte2 = (blockAlign >> 8) & 0xff;
-  frec2.write(byte1);  frec2.write(byte2); 
-  byte1 = bitsPerSample & 0xff;
-  byte2 = (bitsPerSample >> 8) & 0xff;
-  frec2.write(byte1);  frec2.write(byte2); 
-  frec2.write("data");
-  byte1 = Subchunk2Size & 0xff;
-  byte2 = (Subchunk2Size >> 8) & 0xff;
-  byte3 = (Subchunk2Size >> 16) & 0xff;
-  byte4 = (Subchunk2Size >> 24) & 0xff;  
-  frec2.write(byte1);  frec2.write(byte2);  frec2.write(byte3);  frec2.write(byte4);
-  //frec.close();
-  ////Serial.println("header written"); 
-  ////Serial.print("Subchunk2: "); 
-  ////Serial.println(Subchunk2Size); 
+bool writeOutHeader() {
+  byte header[44];
+  songbeam::wavHeader(header, recByteSaved, sampleRate, numChannels);
+  return frec.seek(0) && frec.write(header, sizeof(header)) == sizeof(header);
 }
 
 char *makeFilename(){ 
   static char filename[40];
-  sprintf(filename, "%s_%04d_%02d_%02d_%02d_%02d_%02d%s", devname, year(), month(), day(), hour(), minute(), second(), postfix);
+  snprintf(filename, sizeof(filename), "%s_%04d_%02d_%02d_%02d_%02d_%02d%s", devname, year(), month(), day(), hour(), minute(), second(), postfix);
   return filename;  
 }
 
 time_t getTeensy3Time()
 {
   return Teensy3Clock.get();
-}
-
-void readconfigX(){
-  File myFile = SD.open("config.txt");
-  if (myFile) {
-    int x=0;
-    Serial.println("File available");
-    while (myFile.available()) {
-      Serial.println("Line read");
-      char* line=myFile.read();
-      Serial.println(line);
-      if (x>0){
-        int a=1;
-        String str=String(a);
-        if (x==1){
-          strcpy(devname, line);
-          //devname=line;
-        }
-        else if (x==2){
-          starttimehour=atoi(line);
-        }
-        else if (x==3){
-          starttimemin=atoi(line);
-        }
-        else if (x==4){
-          recordPeriodMins=atoi(line);
-        }
-        else if (x==5){
-          recmins=atoi(line);
-        }
-
-        x=0;
-      }
-
-      if (strcmp(line, "DeviceID:")==0){x=1;}
-      else if (strcmp(line, "RecordStartHrs:")==0){x=2;}
-      else if (strcmp(line, "RecordStartMins:")==0){x=3;}
-      else if (strcmp(line, "RecordLengthMins:")==0){x=4;}
-      else if (strcmp(line, "FileLengthMins:")==0){x=5;} 
-    }
-    myFile.close();
-  }
 }
 
 void readconfig(){
@@ -548,16 +407,16 @@ void readconfig(){
   FsFile file;
   for (int i=0; i<7; i++){recDay[i]=0;}
   if (file.open("config.txt", O_READ)) {
-    int ln = 1;
     int x=0;
     
     while ((n = file.fgets(line, sizeof(line))) > 0) {
-      line[strcspn(line, "\n")] = 0;
+      line[strcspn(line, "\r\n")] = 0;
       if (x>0){
         int a=1;
         String str=String(a);
         if (x==1){
-          strcpy(devname, line);
+          strncpy(devname, line, sizeof(devname)-1);
+          devname[sizeof(devname)-1] = '\0';
           //devname=line;
         }
         else if (x==2){

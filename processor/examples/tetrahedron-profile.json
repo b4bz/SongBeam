@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "id": "example-tetrahedron",
+  "version": 1,
+  "positions_m": [[0, 0, 0], [0.06, 0, 0], [0, 0.06, 0], [0, 0, 0.06]],
+  "layouts": {"raw4": {"channels": 4, "map": [0, 1, 2, 3]}},
+  "rate_range": [16000, 96000],
+  "geometry_status": "synthetic-example-only"
+}

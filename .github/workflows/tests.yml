@@ -1,0 +1,61 @@
+name: Synthetic processing tests
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  processor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          persist-credentials: false
+      - name: Install pinned uv and locked dependencies
+        run: |
+          python3 -m venv "$RUNNER_TEMP/uv-install"
+          "$RUNNER_TEMP/uv-install/bin/pip" install uv==0.11.7
+          "$RUNNER_TEMP/uv-install/bin/uv" sync --directory processor --extra dev --locked
+      - name: Install FFmpeg codec runtime
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          ffmpeg -hide_banner -encoders 2>/dev/null | grep -q libmp3lame
+      - name: Synthetic processor tests
+        run: |
+          "$RUNNER_TEMP/uv-install/bin/uv" run --directory processor ruff check src tests
+          "$RUNNER_TEMP/uv-install/bin/uv" run --directory processor ruff format --check src tests
+          "$RUNNER_TEMP/uv-install/bin/uv" run --directory processor pytest -q
+      - name: Firmware PCM host test
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -Icode tests/test_wav_format.cpp -o "$RUNNER_TEMP/songbeam-wav-test"
+          "$RUNNER_TEMP/songbeam-wav-test"
+  firmware-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          persist-credentials: false
+      - name: Install verified Arduino CLI
+        run: |
+          curl --fail --location --silent --show-error \
+            https://github.com/arduino/arduino-cli/releases/download/v1.5.1/arduino-cli_1.5.1_Linux_64bit.tar.gz \
+            --output "$RUNNER_TEMP/arduino-cli.tar.gz"
+          echo '28a8e119c498a25607821c36cb2dc49e8463941b261a0d99091baa7bc692dd2b  '"$RUNNER_TEMP/arduino-cli.tar.gz" | sha256sum --check
+          tar -xzf "$RUNNER_TEMP/arduino-cli.tar.gz" -C "$RUNNER_TEMP" arduino-cli
+      - name: Compile Teensy 4.1 sketch without hardware
+        env:
+          ARDUINO_DIRECTORIES_DATA: ${{ runner.temp }}/arduino-data
+          ARDUINO_DIRECTORIES_DOWNLOADS: ${{ runner.temp }}/arduino-downloads
+          ARDUINO_DIRECTORIES_USER: ${{ runner.temp }}/arduino-sketchbook
+        run: |
+          CLI="$RUNNER_TEMP/arduino-cli"
+          URL=https://www.pjrc.com/teensy/package_teensy_index.json
+          "$CLI" core update-index --additional-urls "$URL"
+          "$CLI" core install teensy:avr@1.62 --additional-urls "$URL"
+          mkdir -p "$RUNNER_TEMP/SongBeam4C"
+          cp code/SongBeam4C.ino code/WavFormat.h "$RUNNER_TEMP/SongBeam4C/"
+          "$CLI" compile --fqbn teensy:avr:teensy41 --warnings all "$RUNNER_TEMP/SongBeam4C"
