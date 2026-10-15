@@ -130,6 +130,7 @@ bool mtpFilesystemAdded = false;
 bool cardModeNeedsReset = false;
 int autoRecordOnBoot = 1;
 uint8_t usbStereoBuffer[songbeam::kUsbStereoPayloadBytes] = {};
+uint32_t setupCompleteMillis = 0;
 
 
 int recDay[7]={1,1,1,1,1,1,1};
@@ -276,6 +277,7 @@ void setup() {
   
   //set_arm_clock(hiclock);
   delay(1000);
+  setupCompleteMillis = millis();
 }
 
 /*
@@ -301,6 +303,12 @@ void loop() {
     serviceUsb();
     return;
   }
+  // A connected host can take time to enumerate. Give it the USB control
+  // path before autonomous mode opens an SD file.
+  if (!usbWasConfigured && millis() - setupCompleteMillis < 3000U) {
+    delay(10);
+    return;
+  }
   if (usbWasConfigured) {
     if (usbMode == UsbMode::Card) cardModeNeedsReset = true;
     stopUsbMode(false);
@@ -324,7 +332,7 @@ void loop() {
     numChannels = 4;
     const uint32_t remainingMillis = uint32_t(offtime - x) * 1000U;
     if (remainingMillis > 10000U)
-      recordSimple(remainingMillis < tsamplemillis ? remainingMillis : tsamplemillis);
+      recordSimple(remainingMillis < tsamplemillis ? remainingMillis : tsamplemillis, true);
     else {
       digitalWrite(PIN_POWER, HIGH);
       delay(1000);
@@ -336,7 +344,7 @@ void loop() {
     digitalWrite(PIN_POWER, HIGH);
     delay(1000);
   } else if (x > begintime) {
-    recordSimple(tsamplemillis);
+    recordSimple(tsamplemillis, true);
   } else {
     delay(1000);
   }
@@ -421,7 +429,7 @@ void handleUsbCommand(const char* command) {
     stopUsbMode(false);
     numChannels = 4;
     Serial.println("OK RECORD 1");
-    recordSimple(tsamplemillis);  // one bounded file, then USB-controlled idle
+    recordSimple(tsamplemillis, false);  // one bounded file, then USB-controlled idle
     Serial.println(recordingFailed ? "ERR RECORD INCOMPLETE" : "OK RECORD DONE");
   } else if (strncmp(command, "TIME ", 5) == 0) {
     char* end = nullptr;
@@ -492,7 +500,7 @@ void serviceUsb() {
   }
 }
 
-void recordSimple(unsigned long ts){
+void recordSimple(unsigned long ts, bool stopWhenUsbAppears){
   set_arm_clock(captureClock);
   delay(500);
   if (numChannels==2){
@@ -501,7 +509,8 @@ void recordSimple(unsigned long ts){
       // Starting the timer before preAllocate() shortened real recordings by
       // the card's variable allocation latency (1.14 s in the bench run).
       elapsedMillis recordingTime = 0;
-      while(recordingTime<ts && !recordingFailed && mode == 1) continueRecording2Chan();
+      while(recordingTime<ts && !recordingFailed && mode == 1 &&
+            (!stopWhenUsbAppears || !usb_configuration)) continueRecording2Chan();
       stopRecording2Chan(fn);
     }
   }
@@ -509,7 +518,8 @@ void recordSimple(unsigned long ts){
     char* fn=startRecording();  
     if (fn) {
       elapsedMillis recordingTime = 0;
-      while(recordingTime<ts && !recordingFailed && mode == 1) continueRecording();
+      while(recordingTime<ts && !recordingFailed && mode == 1 &&
+            (!stopWhenUsbAppears || !usb_configuration)) continueRecording();
       stopRecording(fn);
     }
   }
