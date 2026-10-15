@@ -184,6 +184,21 @@ void captureSdError() {
   lastSdErrorData = SD.sdfs.card() ? SD.sdfs.card()->errorData() : 0;
 }
 
+uint32_t backupRtcEpoch() {
+  // SNVS low-power RTC is the clock maintained by VBAT. Read a stable pair
+  // so STATUS can distinguish lost backup time from high-power RTC sync.
+  uint32_t high = SNVS_LPSRTCMR;
+  uint32_t low = SNVS_LPSRTCLR;
+  while (true) {
+    const uint32_t nextHigh = SNVS_LPSRTCMR;
+    const uint32_t nextLow = SNVS_LPSRTCLR;
+    if (high == nextHigh && low == nextLow)
+      return (nextHigh << 17) | (nextLow >> 15);
+    high = nextHigh;
+    low = nextLow;
+  }
+}
+
 int PIN_POWER=32;
 
 #define SDCARD_CS_PIN    BUILTIN_SDCARD
@@ -393,6 +408,8 @@ void handleUsbCommand(const char* command) {
     Serial.print(" FILEMINS="); Serial.print(recmins);
     Serial.print(" RTC="); Serial.print(year() >= 2020 && year() <= 2100 ? 1 : 0);
     Serial.print(" EPOCH="); Serial.print((uint32_t)Teensy3Clock.get());
+    Serial.print(" BACKUPEPOCH="); Serial.print(backupRtcEpoch());
+    Serial.print(" BACKUPRUN="); Serial.print((SNVS_LPCR & SNVS_LPCR_SRTC_ENV) ? 1 : 0);
     Serial.print(" FAILURES="); Serial.print(failedRecordings);
     Serial.print(" FATAL="); Serial.print(sdFatal ? 1 : 0);
     Serial.print(" SDERR="); Serial.print(lastSdErrorCode);

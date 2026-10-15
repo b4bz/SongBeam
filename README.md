@@ -68,7 +68,7 @@ A supervised SongBeam 3.1 / Teensy 4.1 USB test produced three readable 44.1 kHz
 
 The latest source also latches storage or capture-integrity failures for that power session: autonomous recording stops, `STATUS` reports `FATAL=1` with an SD error code when available, and an incomplete WAV receives a `.failed` marker if the card still accepts writes. This behavior compiles but needs a controlled hardware fault test before being treated as verified.
 
-`STATUS` reports the configured device ID, file length and raw RTC epoch. SD diagnostics retain the controller's full 32-bit error data rather than the SdFat convenience wrapper's truncated value, so a replacement-card test can preserve useful failure evidence.
+`STATUS` reports the configured device ID, file length, active RTC epoch, backup RTC epoch and backup-clock enable state. These values help distinguish loss of VBAT-backed time from startup synchronization. SD diagnostics retain the controller's full 32-bit error data rather than the SdFat convenience wrapper's truncated value, so a replacement-card test can preserve useful failure evidence.
 
 ### Experimental USB modes
 
