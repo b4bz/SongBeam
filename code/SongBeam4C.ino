@@ -77,7 +77,17 @@ int resistChoice=0;
 int recordPeriodMins=180;
 
 //int hiclock=450000000;
-int hiclock=24000000;
+// Use the fast clock while moving four synchronized channels to SD.  The
+// previous 24 MHz setting is retained for idle time to limit battery draw.
+constexpr uint32_t captureClock = 150000000;
+constexpr uint32_t idleClock = 24000000;
+constexpr unsigned int audioPoolBlocks = 512;
+constexpr int writeBatchBlocks = 8;
+static DMAMEM __attribute__((aligned(32))) byte writeBuffer[writeBatchBlocks * 128 * 4 * 2];
+uint32_t recordStartMillis = 0;
+uint32_t preparationMillis = 0;
+uint32_t worstWriteMicros = 0;
+uint32_t sdWriteCalls = 0;
 
 int PIN_POWER=32;
 
@@ -86,7 +96,7 @@ int PIN_POWER=32;
 
 void setup() {
 
-  set_arm_clock(hiclock);
+  set_arm_clock(idleClock);
 
   
   Serial.begin(9600);
@@ -106,7 +116,7 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
 
   
-  AudioMemory(120);
+  AudioMemory(audioPoolBlocks);
   
   if (!(SD.sdfs.begin(SdioConfig(FIFO_SDIO)))) {
     // stop here, but print a message repetitively
@@ -209,7 +219,7 @@ void loops(){
 }
 */
 void loop() {
-  set_arm_clock(hiclock);
+  set_arm_clock(idleClock);
   int x=now();
   //Serial.print("New loop: ");
   //Serial.println(x);
@@ -244,27 +254,34 @@ void loop() {
 }
 
 void recordSimple(unsigned long ts){
-  //set_arm_clock(hiclock);
+  set_arm_clock(captureClock);
   delay(500);
-  //Serial.println("Recording ");
-  //Serial.println(now());
-  elapsedMillis recordingTime = 0;
   if (numChannels==2){
     char* fn=startRecording2Chan();
-    while(recordingTime<ts && !recordingFailed && mode == 1) continueRecording2Chan();
-    stopRecording2Chan(fn);
+    if (fn) {
+      // Starting the timer before preAllocate() shortened real recordings by
+      // the card's variable allocation latency (1.14 s in the bench run).
+      elapsedMillis recordingTime = 0;
+      while(recordingTime<ts && !recordingFailed && mode == 1) continueRecording2Chan();
+      stopRecording2Chan(fn);
+    }
   }
   else{
     char* fn=startRecording();  
-    while(recordingTime<ts && !recordingFailed && mode == 1) continueRecording();
-    stopRecording(fn);
+    if (fn) {
+      elapsedMillis recordingTime = 0;
+      while(recordingTime<ts && !recordingFailed && mode == 1) continueRecording();
+      stopRecording(fn);
+    }
   }
+  set_arm_clock(idleClock);
   delay(1000);
 }
 
 
 char* startRecordingChannels(unsigned int channels) {
   static char filename[48];
+  const uint32_t prepareStart = millis();
   const char* base = makeFilename();
   size_t stemLength = strlen(base) - strlen(postfix);
   recordingFailed = false;
@@ -293,6 +310,11 @@ char* startRecordingChannels(unsigned int channels) {
   }
   queue1.begin(); queue2.begin();
   if (channels == 4) { queue1a.begin(); queue2a.begin(); }
+  AudioMemoryUsageMaxReset();
+  recordStartMillis = millis();
+  preparationMillis = recordStartMillis - prepareStart;
+  worstWriteMicros = 0;
+  sdWriteCalls = 0;
   mode = 1;
   recByteSaved = 0;
   maxQueueDepth = 0;
@@ -302,18 +324,24 @@ char* startRecordingChannels(unsigned int channels) {
 char* startRecording() { return startRecordingChannels(4); }
 char* startRecording2Chan() { return startRecordingChannels(2); }
 
-void writeInterleavedBlock(unsigned int channels) {
-  byte block[1024];
-  memcpy(bufferL, queue1.readBuffer(), 256); queue1.freeBuffer();
-  memcpy(bufferR, queue2.readBuffer(), 256); queue2.freeBuffer();
-  if (channels == 4) {
-    memcpy(bufferLa, queue1a.readBuffer(), 256); queue1a.freeBuffer();
-    memcpy(bufferRa, queue2a.readBuffer(), 256); queue2a.freeBuffer();
+void writeInterleavedBlocks(unsigned int channels, unsigned int blocks) {
+  for (unsigned int i = 0; i < blocks; ++i) {
+    memcpy(bufferL, queue1.readBuffer(), 256); queue1.freeBuffer();
+    memcpy(bufferR, queue2.readBuffer(), 256); queue2.freeBuffer();
+    if (channels == 4) {
+      memcpy(bufferLa, queue1a.readBuffer(), 256); queue1a.freeBuffer();
+      memcpy(bufferRa, queue2a.readBuffer(), 256); queue2a.freeBuffer();
+    }
+    const uint8_t* inputs[4] = {bufferL, bufferR, bufferLa, bufferRa};
+    songbeam::interleave128(inputs, channels,
+                            writeBuffer + i * 128U * channels * 2U);
   }
-  const uint8_t* inputs[4] = {bufferL, bufferR, bufferLa, bufferRa};
-  songbeam::interleave128(inputs, channels, block);
-  const size_t wanted = 128U * channels * 2U;
-  const size_t written = frec.write(block, wanted);
+  const size_t wanted = blocks * 128U * channels * 2U;
+  const uint32_t writeStart = micros();
+  const size_t written = frec.write(writeBuffer, wanted);
+  const uint32_t writeMicros = micros() - writeStart;
+  if (writeMicros > worstWriteMicros) worstWriteMicros = writeMicros;
+  ++sdWriteCalls;
   recByteSaved += written - written % (channels * 2U);
   if (written != wanted) { recordingFailed = true; Serial.println("Short SD audio write"); }
 }
@@ -325,8 +353,9 @@ void continueRecording() {
   if (queue1a.available() > maxQueueDepth) maxQueueDepth = queue1a.available();
   if (queue2a.available() > maxQueueDepth) maxQueueDepth = queue2a.available();
 
-  if (queue1.available() >= 2 && queue2.available() >= 2 && queue1a.available() >=2 && queue2a.available() >=2) {
-    writeInterleavedBlock(4);
+  if (queue1.available() >= writeBatchBlocks && queue2.available() >= writeBatchBlocks &&
+      queue1a.available() >= writeBatchBlocks && queue2a.available() >= writeBatchBlocks) {
+    writeInterleavedBlocks(4, writeBatchBlocks);
   } 
 }
 
@@ -335,8 +364,8 @@ void continueRecording2Chan() {
   if (queue1.available() > maxQueueDepth) maxQueueDepth = queue1.available();
   if (queue2.available() > maxQueueDepth) maxQueueDepth = queue2.available();
 
-  if (queue1.available() >= 2 && queue2.available() >= 2) {
-    writeInterleavedBlock(2);
+  if (queue1.available() >= writeBatchBlocks && queue2.available() >= writeBatchBlocks) {
+    writeInterleavedBlocks(2, writeBatchBlocks);
   } 
 }
 
@@ -348,14 +377,31 @@ void stopRecording(char* fn) {
   queue1a.end();
   queue2a.end();
   if (mode == 1) {
-    while (!recordingFailed && queue1.available() > 0 && queue2.available() > 0 && queue1a.available() > 0 && queue2a.available() > 0) writeInterleavedBlock(4);
+    const uint32_t captureMillis = millis() - recordStartMillis;
+    while (!recordingFailed && queue1.available() >= writeBatchBlocks && queue2.available() >= writeBatchBlocks &&
+           queue1a.available() >= writeBatchBlocks && queue2a.available() >= writeBatchBlocks)
+      writeInterleavedBlocks(4, writeBatchBlocks);
+    while (!recordingFailed && queue1.available() > 0 && queue2.available() > 0 &&
+           queue1a.available() > 0 && queue2a.available() > 0) writeInterleavedBlocks(4, 1);
     if (queue1.available() || queue2.available() || queue1a.available() || queue2a.available()) recordingFailed = true;
+    const uint64_t expectedFrames = (uint64_t)sampleRate * captureMillis / 1000;
+    const uint64_t savedFrames = recByteSaved / (4U * 2U);
+    if (savedFrames + sampleRate / 10 < expectedFrames) {
+      recordingFailed = true;
+      Serial.println("Audio duration short: possible dropped capture blocks");
+    }
     if (!frec.seek(44ULL + recByteSaved) || !frec.truncate()) recordingFailed = true;
     if (!writeOutHeader() || !frec.sync()) recordingFailed = true;
     frec.close();
     if (recordingFailed) Serial.println("Recording incomplete: inspect WAV before processing");
     Serial.print("Max audio memory blocks: "); Serial.println(AudioMemoryUsageMax());
     Serial.print("Max queue depth: "); Serial.println(maxQueueDepth);
+    Serial.print("Preparation ms: "); Serial.println(preparationMillis);
+    Serial.print("Capture ms: "); Serial.println(captureMillis);
+    Serial.print("Saved frames: "); Serial.println((uint32_t)savedFrames);
+    Serial.print("SD write calls: "); Serial.println(sdWriteCalls);
+    Serial.print("Worst SD write us: "); Serial.println(worstWriteMicros);
+    if (AudioMemoryUsageMax() >= audioPoolBlocks) Serial.println("Audio pool saturated");
   }
   mode = 0;
   //Serial.print("finishedRecording ");
@@ -368,14 +414,29 @@ void stopRecording2Chan(char* fn) {
   queue1.end();
   queue2.end();
   if (mode == 1) {
-    while (!recordingFailed && queue1.available() > 0 && queue2.available() > 0) writeInterleavedBlock(2);
+    const uint32_t captureMillis = millis() - recordStartMillis;
+    while (!recordingFailed && queue1.available() >= writeBatchBlocks && queue2.available() >= writeBatchBlocks)
+      writeInterleavedBlocks(2, writeBatchBlocks);
+    while (!recordingFailed && queue1.available() > 0 && queue2.available() > 0) writeInterleavedBlocks(2, 1);
     if (queue1.available() || queue2.available()) recordingFailed = true;
+    const uint64_t expectedFrames = (uint64_t)sampleRate * captureMillis / 1000;
+    const uint64_t savedFrames = recByteSaved / (2U * 2U);
+    if (savedFrames + sampleRate / 10 < expectedFrames) {
+      recordingFailed = true;
+      Serial.println("Audio duration short: possible dropped capture blocks");
+    }
     if (!frec.seek(44ULL + recByteSaved) || !frec.truncate()) recordingFailed = true;
     if (!writeOutHeader() || !frec.sync()) recordingFailed = true;
     frec.close();
     if (recordingFailed) Serial.println("Recording incomplete: inspect WAV before processing");
     Serial.print("Max audio memory blocks: "); Serial.println(AudioMemoryUsageMax());
     Serial.print("Max queue depth: "); Serial.println(maxQueueDepth);
+    Serial.print("Preparation ms: "); Serial.println(preparationMillis);
+    Serial.print("Capture ms: "); Serial.println(captureMillis);
+    Serial.print("Saved frames: "); Serial.println((uint32_t)savedFrames);
+    Serial.print("SD write calls: "); Serial.println(sdWriteCalls);
+    Serial.print("Worst SD write us: "); Serial.println(worstWriteMicros);
+    if (AudioMemoryUsageMax() >= audioPoolBlocks) Serial.println("Audio pool saturated");
   }
   mode = 0;
   //Serial.print("finishedRecording ");
