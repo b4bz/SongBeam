@@ -34,6 +34,8 @@ jobs:
           "$RUNNER_TEMP/songbeam-wav-test"
           g++ -std=c++17 -Wall -Wextra -Werror -Icode tests/test_capture_ring.cpp -o "$RUNNER_TEMP/songbeam-ring-test"
           "$RUNNER_TEMP/songbeam-ring-test"
+          g++ -std=c++17 -Wall -Wextra -Werror -Icode tests/test_usb_frame.cpp -o "$RUNNER_TEMP/songbeam-usb-frame-test"
+          "$RUNNER_TEMP/songbeam-usb-frame-test"
   firmware-build:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -59,5 +61,5 @@ jobs:
           "$CLI" core update-index --additional-urls "$URL"
           "$CLI" core install teensy:avr@1.62 --additional-urls "$URL"
           mkdir -p "$RUNNER_TEMP/SongBeam4C"
-          cp code/SongBeam4C.ino code/WavFormat.h code/CaptureRing.h "$RUNNER_TEMP/SongBeam4C/"
-          "$CLI" compile --fqbn teensy:avr:teensy41 --warnings all "$RUNNER_TEMP/SongBeam4C"
+          cp code/SongBeam4C.ino code/WavFormat.h code/CaptureRing.h code/UsbFrame.h "$RUNNER_TEMP/SongBeam4C/"
+          "$CLI" compile --fqbn teensy:avr:teensy41 --board-options usb=serialmidiaudio --warnings all "$RUNNER_TEMP/SongBeam4C"

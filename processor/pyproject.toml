@@ -11,9 +11,11 @@ dependencies = ["numpy>=2.0,<3", "scipy>=1.13,<2", "soundfile>=0.12,<1"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8,<10", "ruff==0.16.10"]
+usb = ["pyserial>=3.5,<4"]
 
 [project.scripts]
 songbeam = "songbeam.cli:main"
+songbeam-usb-capture = "songbeam.usb_capture:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

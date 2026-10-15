@@ -8,9 +8,11 @@
 #include <TimeAlarms.h>
 #include <string.h>
 #include "CaptureRing.h"
+#include "UsbFrame.h"
 #include "WavFormat.h"
 
 extern "C" uint32_t set_arm_clock(uint32_t frequency);
+extern "C" volatile uint8_t usb_configuration;
 
 char postfix[5]=".wav";
 char devname[5]="R01_";
@@ -112,6 +114,31 @@ AudioConnection patchCord2(audioInput, 1, capture, 1);
 AudioConnection patchCord3(audioInput2, 0, capture, 2);
 AudioConnection patchCord4(audioInput2, 1, capture, 3);
 
+#ifdef AUDIO_INTERFACE
+// Provisional PCB groups: A1/A2 use I2S1; A3/A4 use I2S2.  Verify physical
+// channel identity and enclosure orientation before treating L/R as calibrated.
+AudioMixer4 usbLeftMixer;
+AudioMixer4 usbRightMixer;
+AudioOutputUSB usbAudio;
+AudioConnection usbLeft0;
+AudioConnection usbLeft1;
+AudioConnection usbRight0;
+AudioConnection usbRight1;
+AudioConnection usbOutLeft(usbLeftMixer, 0, usbAudio, 0);
+AudioConnection usbOutRight(usbRightMixer, 0, usbAudio, 1);
+#endif
+
+enum class UsbMode : uint8_t { Idle, Raw4, Stereo2 };
+UsbMode usbMode = UsbMode::Idle;
+char usbCommand[48] = {};
+uint8_t usbCommandLength = 0;
+uint32_t usbSequence = 0;
+uint32_t usbStreamStartMillis = 0;
+uint32_t usbSentFrames = 0;
+bool usbWasConfigured = false;
+bool sdReady = false;
+int autoRecordOnBoot = 1;
+
 
 int recDay[7]={1,1,1,1,1,1,1};
 
@@ -119,6 +146,7 @@ int recDay[7]={1,1,1,1,1,1,1};
 int mode = 0;  // 0=stopped, 1=recording, 2=playing
 FsFile frec;
 bool recordingFailed = false;
+uint32_t failedRecordings = 0;
 uint32_t maxRingDepth = 0;
 elapsedMillis  msecs;
 
@@ -157,6 +185,9 @@ int PIN_POWER=32;
 
 #define SDCARD_CS_PIN    BUILTIN_SDCARD
 
+void serviceUsb();
+void stopUsbMode(bool sendEndFrame);
+
 
 void setup() {
 
@@ -181,18 +212,20 @@ void setup() {
 
   
   AudioMemory(audioPoolBlocks);
-  
-  if (!(SD.sdfs.begin(SdioConfig(FIFO_SDIO)))) {
-    // stop here, but print a message repetitively
-    while (1) {
-      digitalWrite(LED_BUILTIN, HIGH);   // turn the LED on (HIGH is the voltage level)
-      delay(250);               // wait for a second
-      digitalWrite(LED_BUILTIN, LOW);    // turn the LED off by making the voltage LOW
-      delay(250);
-    }
+#ifdef AUDIO_INTERFACE
+  usbLeftMixer.gain(0, 0.5f);
+  usbLeftMixer.gain(1, 0.5f);
+  usbRightMixer.gain(0, 0.5f);
+  usbRightMixer.gain(1, 0.5f);
+#endif
+
+  sdReady = SD.sdfs.begin(SdioConfig(FIFO_SDIO));
+  if (sdReady) {
+    Serial.println("reading config file");
+    readconfig();
+  } else {
+    Serial.println("SD unavailable: USB streaming remains possible");
   }
-  Serial.println("reading config file");
-  readconfig();
   if (numChannels != 2 && numChannels != 4) numChannels = 4;
   if (recmins < 1 || recmins > 120) recmins = 15;
   if (recordPeriodMins < 1 || recordPeriodMins > 1440) recordPeriodMins = 180;
@@ -209,8 +242,6 @@ void setup() {
   digitalWrite(PIN_POWER, LOW);
   if (year() < 2020 || year() > 2100) {
     Serial.println("Invalid RTC: recording disabled");
-    digitalWrite(PIN_POWER, HIGH);
-    while (1) delay(1000);
   }
 
   Serial.println(devname);
@@ -241,7 +272,6 @@ void setup() {
 
   Serial.println("WEEKDAY:");
   Serial.println(tm.Wday);
-  int day=tm.Wday-1;
 
   
   begintime=makeTime(tm);
@@ -249,12 +279,6 @@ void setup() {
   
  time_t x=now();
  offtime=x+ontime;
-  
-  if ((recDay[day]==0)||(x>endtime)||(offtime-60<begintime)){
-    digitalWrite(PIN_POWER, HIGH);
-    Serial.println("SHUTDOWN");
-  }
-
   offtime=offtime-(recmins+1)*60;
 
   Serial.println(x);
@@ -283,37 +307,178 @@ void loops(){
 }
 */
 void loop() {
-  set_arm_clock(idleClock);
-  int x=now();
-  //Serial.print("New loop: ");
-  //Serial.println(x);
-  if ((x>begintime)&&(x<endtime)){
-    //Serial.println("Considering recording");
-    
-    //set_arm_clock(hiclock);
-    if (x>offtime){
-      int p=tsamplemillis-1000*(x-offtime);
-      if (p>10000){
-        recordSimple(p);
-      }
-      else{
-        digitalWrite(PIN_POWER, HIGH);
-        delay(1000);
-      }
-    }
-    else{
-      recordSimple(tsamplemillis);
-    }
+  if (usb_configuration) {
+    usbWasConfigured = true;
+    serviceUsb();
+    return;
   }
-  else if (x>endtime){
-    //Serial.println("Decided to turn off");
+  if (usbWasConfigured) {
+    stopUsbMode(false);
+    usbWasConfigured = false;
+  }
+  set_arm_clock(idleClock);
+  if (!sdReady || year() < 2020 || year() > 2100) {
+    digitalWrite(LED_BUILTIN, HIGH);
+    delay(250);
+    digitalWrite(LED_BUILTIN, LOW);
+    delay(750);
+    return;
+  }
+  const time_t x = now();
+  if (x >= offtime) {
     digitalWrite(PIN_POWER, HIGH);
     delay(1000);
+    return;
   }
-  else{
-    //Serial.println("waiting to start");
-    //set_arm_clock(loclock);
+  if (autoRecordOnBoot) {
+    numChannels = 4;
+    const uint32_t remainingMillis = uint32_t(offtime - x) * 1000U;
+    if (remainingMillis > 10000U)
+      recordSimple(remainingMillis < tsamplemillis ? remainingMillis : tsamplemillis);
+    else {
+      digitalWrite(PIN_POWER, HIGH);
+      delay(1000);
+    }
+    return;
+  }
+  const int day = weekday(x) - 1;
+  if (recDay[day] == 0 || x >= endtime) {
+    digitalWrite(PIN_POWER, HIGH);
     delay(1000);
+  } else if (x > begintime) {
+    recordSimple(tsamplemillis);
+  } else {
+    delay(1000);
+  }
+}
+
+void stopUsbMode(bool sendEndFrame) {
+  if (usbMode == UsbMode::Raw4) {
+    capture.end();
+    const uint32_t undelivered = capture.ring.available();
+    const uint32_t lost = capture.ring.droppedBlocks() +
+                          capture.missingInputBlocks + undelivered;
+    if (sendEndFrame && Serial.dtr()) {
+      uint8_t header[songbeam::kUsbFrameHeaderBytes];
+      songbeam::usbFrameHeader(header, songbeam::kUsbFrameEnd, 0,
+                               usbSequence, millis() - usbStreamStartMillis,
+                               lost, 0);
+      Serial.write(header, sizeof(header));
+    }
+  }
+#ifdef AUDIO_INTERFACE
+  if (usbMode == UsbMode::Stereo2) {
+    AudioNoInterrupts();
+    usbLeft0.disconnect(); usbLeft1.disconnect();
+    usbRight0.disconnect(); usbRight1.disconnect();
+    AudioInterrupts();
+  }
+#endif
+  usbMode = UsbMode::Idle;
+  set_arm_clock(idleClock);
+}
+
+void handleUsbCommand(const char* command) {
+  if (usbMode == UsbMode::Raw4 && strcmp(command, "STOP") != 0) return;
+  if (strcmp(command, "STATUS") == 0) {
+    Serial.print("SB FW USB1 SD="); Serial.print(sdReady ? 1 : 0);
+    Serial.print(" RTC="); Serial.print(year() >= 2020 && year() <= 2100 ? 1 : 0);
+    Serial.print(" MODE="); Serial.println(static_cast<int>(usbMode));
+  } else if (strcmp(command, "STREAM 4") == 0) {
+    stopUsbMode(false);
+    set_arm_clock(captureClock);
+    capture.begin(4);
+    AudioMemoryUsageMaxReset();
+    usbSequence = 0;
+    usbSentFrames = 0;
+    usbStreamStartMillis = millis();
+    usbMode = UsbMode::Raw4;
+    Serial.println("OK STREAM4 44100 4 S16LE");
+  } else if (strcmp(command, "STREAM 2") == 0) {
+#ifdef AUDIO_INTERFACE
+    stopUsbMode(false);
+    set_arm_clock(captureClock);
+    AudioNoInterrupts();
+    usbLeft0.connect(audioInput, 0, usbLeftMixer, 0);
+    usbLeft1.connect(audioInput, 1, usbLeftMixer, 1);
+    usbRight0.connect(audioInput2, 0, usbRightMixer, 0);
+    usbRight1.connect(audioInput2, 1, usbRightMixer, 1);
+    AudioInterrupts();
+    usbMode = UsbMode::Stereo2;
+    Serial.println("OK STREAM2 44100 2 S16LE");
+#else
+    Serial.println("ERR stereo USB audio not in this build");
+#endif
+  } else if (strcmp(command, "STOP") == 0) {
+    const bool wasRaw4 = usbMode == UsbMode::Raw4;
+    stopUsbMode(true);
+    if (!wasRaw4) Serial.println("OK STOP");
+  } else if (strcmp(command, "RECORD 1") == 0) {
+    if (!sdReady || year() < 2020 || year() > 2100) {
+      Serial.println("ERR SD or RTC unavailable");
+      return;
+    }
+    stopUsbMode(false);
+    numChannels = 4;
+    Serial.println("OK RECORD 1");
+    recordSimple(tsamplemillis);  // one bounded file, then USB-controlled idle
+    Serial.println(recordingFailed ? "ERR RECORD INCOMPLETE" : "OK RECORD DONE");
+  } else if (strncmp(command, "TIME ", 5) == 0) {
+    char* end = nullptr;
+    const unsigned long epoch = strtoul(command + 5, &end, 10);
+    if (!end || *end || epoch < 1577836800UL || epoch > 4102444800UL) {
+      Serial.println("ERR invalid UTC epoch");
+      return;
+    }
+    Teensy3Clock.set(epoch);
+    setTime(epoch);
+    Serial.println("OK TIME");
+  } else if (usbMode != UsbMode::Raw4) {
+    Serial.println("ERR unknown command");
+  }
+}
+
+void serviceUsb() {
+  for (unsigned i = 0; i < 32 && Serial.available() > 0; ++i) {
+    const int received = Serial.read();
+    if (received == '\r') continue;
+    if (received == '\n') {
+      usbCommand[usbCommandLength] = '\0';
+      handleUsbCommand(usbCommand);
+      usbCommandLength = 0;
+    } else if (received >= 32 && received <= 126 &&
+               usbCommandLength < sizeof(usbCommand) - 1) {
+      usbCommand[usbCommandLength++] = static_cast<char>(received);
+    } else {
+      usbCommandLength = 0;
+    }
+  }
+  if (usbMode != UsbMode::Raw4) {
+    if (usbMode == UsbMode::Idle) delay(1);
+    return;
+  }
+  if (!Serial.dtr()) {
+    stopUsbMode(false);
+    return;
+  }
+  for (unsigned i = 0; i < 8 && capture.ring.available() > 0; ++i) {
+    if (Serial.availableForWrite() <
+        int(songbeam::kUsbFrameHeaderBytes + songbeam::kUsbFramePayloadBytes)) break;
+    const uint8_t* payload = capture.ring.front();
+    uint8_t header[songbeam::kUsbFrameHeaderBytes];
+    songbeam::usbFrameHeader(header, songbeam::kUsbFrameAudio, 128,
+                             usbSequence, millis() - usbStreamStartMillis,
+                             capture.ring.droppedBlocks() + capture.missingInputBlocks,
+                             songbeam::crc32(payload, songbeam::kUsbFramePayloadBytes));
+    const size_t sentHeader = Serial.write(header, sizeof(header));
+    const size_t sentPayload = Serial.write(payload, songbeam::kUsbFramePayloadBytes);
+    if (sentHeader != sizeof(header) || sentPayload != songbeam::kUsbFramePayloadBytes) {
+      stopUsbMode(false);  // host will reject the truncated frame
+      return;
+    }
+    capture.ring.consume(1);
+    ++usbSequence;
+    usbSentFrames += 128;
   }
 }
 
@@ -413,7 +578,7 @@ void continueRecording2Chan() {
   if (depth >= writeBatchBlocks) writeInterleavedBlocks(2, writeBatchBlocks);
 }
 
-void stopRecordingChannels(unsigned int channels) {
+void stopRecordingChannels(unsigned int channels, const char* filename) {
   capture.end();
   if (mode != 1) return;
   const uint32_t captureMillis = millis() - recordStartMillis;
@@ -434,7 +599,22 @@ void stopRecordingChannels(unsigned int channels) {
   if (!frec.seek(44ULL + recByteSaved) || !frec.truncate()) recordingFailed = true;
   if (!writeOutHeader() || !frec.sync()) recordingFailed = true;
   frec.close();
-  if (recordingFailed) Serial.println("Recording incomplete: inspect WAV before processing");
+  if (recordingFailed) {
+    ++failedRecordings;
+    digitalWrite(LED_BUILTIN, HIGH);
+    char failedName[64];
+    snprintf(failedName, sizeof(failedName), "%s.failed", filename);
+    FsFile marker = SD.sdfs.open(failedName, O_WRONLY | O_CREAT | O_EXCL);
+    if (marker) {
+      marker.print("INCOMPLETE SONG BEAM WAV\nCaptureMs="); marker.println(captureMillis);
+      marker.print("SavedFrames="); marker.println((uint32_t)savedFrames);
+      marker.print("DroppedRingBlocks="); marker.println(dropped);
+      marker.print("MissingInputBlocks="); marker.println(missing);
+      marker.print("WorstSDWriteUs="); marker.println(worstWriteMicros);
+      marker.sync(); marker.close();
+    }
+    Serial.println("Recording incomplete: inspect WAV and .failed marker");
+  }
   Serial.print("Max audio memory blocks: "); Serial.println(AudioMemoryUsageMax());
   Serial.print("Max ring depth: "); Serial.println(maxRingDepth);
   Serial.print("Capture ring capacity: "); Serial.println(capture.ring.capacity());
@@ -449,8 +629,8 @@ void stopRecordingChannels(unsigned int channels) {
   mode = 0;
 }
 
-void stopRecording(char* fn) { (void)fn; stopRecordingChannels(4); }
-void stopRecording2Chan(char* fn) { (void)fn; stopRecordingChannels(2); }
+void stopRecording(char* fn) { stopRecordingChannels(4, fn); }
+void stopRecording2Chan(char* fn) { stopRecordingChannels(2, fn); }
 
 
 bool writeOutHeader() {
@@ -502,31 +682,34 @@ void readconfig(){
           recmins=atoi(line);
         }
         else if (x==6){
-          recDay[0]=1;
+          recDay[0]=atoi(line) != 0;
         }
         else if (x==7){
-          recDay[1]=1;
+          recDay[1]=atoi(line) != 0;
         }
         else if (x==8){
-          recDay[2]=1;
+          recDay[2]=atoi(line) != 0;
         }
         else if (x==9){
-          recDay[3]=1;
+          recDay[3]=atoi(line) != 0;
         }
         else if (x==10){
-          recDay[4]=1;
+          recDay[4]=atoi(line) != 0;
         }
         else if (x==11){
-          recDay[5]=1;
+          recDay[5]=atoi(line) != 0;
         }
         else if (x==12){
-          recDay[6]=1;
+          recDay[6]=atoi(line) != 0;
         }
         else if (x==13){
           numChannels=atoi(line);
         }
         else if (x==14){
           resistChoice=atoi(line);
+        }
+        else if (x==15){
+          autoRecordOnBoot=atoi(line) != 0;
         }
 
         x=0;
@@ -546,6 +729,7 @@ void readconfig(){
       else if (strcmp(line, "RecSat:")==0){x=12;} 
       else if (strcmp(line, "NumChan:")==0){x=13;}
       else if (strcmp(line, "Resist:")==0){x=14;}
+      else if (strcmp(line, "AutoRecordOnBoot:")==0){x=15;}
 
   }
   file.close();

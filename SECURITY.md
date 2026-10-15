@@ -22,6 +22,8 @@ Treat filenames, audio headers, metadata and configuration as untrusted. Validat
 
 Check the intended data filesystem and available space before and during writes. Do not fall back onto an unmounted directory on the OS disk. Disk checks are not quotas; concurrent jobs need admission control or reservations. Write private local outputs with restrictive permissions and redact location/path details from shareable reports.
 
+The experimental USB Serial command channel is available only to a physically connected host and has no authentication. Do not expose it through a network bridge or grant untrusted users access to the device node. USB enumeration defaults to controlled idle, so connecting a computer must not silently start recording or streaming. The four-channel binary receiver checks version, sequence, CRC and reported loss and retains incomplete output as a partial file. It requires an explicit new output path and can enforce a mounted data drive. Keep raw USB captures, status manifests and precise timestamps outside Git. Do not connect USB and main batteries together until the actual board power paths have been verified.
+
 ## CI and releases
 
 Use GitHub-hosted runners for untrusted contributions, minimal read-only token permissions and Actions pinned to full reviewed commit SHAs. No deployment secrets or local data mounts in pull-request tests. Do not combine privileged `pull_request_target` with checkout/execution of untrusted contributor code. Keep artifacts to an explicit allowlist of sanitized reports and deterministic synthetic results. Publish firmware binaries only from identified source/toolchain builds with hashes; never auto-flash hardware.

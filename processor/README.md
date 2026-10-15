@@ -28,4 +28,16 @@ SongBeam's physical array is linear. A direction score does not establish specie
 
 Offline verification: `uv run pytest -q`, `uv run ruff check src tests scripts`, and optionally `PYTHONPATH=src uv run python scripts/evaluate_fixtures.py /path/to/external-fixtures --output /path/to/new-results.json`. The optional fixture suite uses licensed bird excerpts kept outside Git. To measure runtime on procedural audio, run `PYTHONPATH=src uv run python scripts/benchmark_profiles.py --profile sipeed-d80 --minutes 10 --scratch-parent /tmp` (also supports `songbeam-4` and 1/30 minutes). The benchmark removes only its own temporary files. Synthetic/ideal-array tests do not establish physical channel mapping, enclosure response or field accuracy.
 
-Reproducible checks: `uv sync --extra dev --locked` from this directory, then `uv run pytest -q`. For the recorder's pure WAV helper, run `g++ -std=c++17 -Wall -Wextra -Werror -Icode tests/test_wav_format.cpp -o /tmp/songbeam-wav-test && /tmp/songbeam-wav-test` from the repository root. Compile the Teensy sketch with Teensyduino 1.62 for Teensy 4.1; Arduino CLI needs a temporary sketch folder named `SongBeam4C` with `SongBeam4C.ino` and `WavFormat.h`. No firmware build or output from this repository should be flashed without a physical validation step and a known-good recovery image.
+Reproducible checks: `uv sync --extra dev --locked` from this directory, then `uv run pytest -q`. For the recorder's pure WAV helper, run `g++ -std=c++17 -Wall -Wextra -Werror -Icode tests/test_wav_format.cpp -o /tmp/songbeam-wav-test && /tmp/songbeam-wav-test` from the repository root. Compile the Teensy sketch with Teensyduino 1.62 for Teensy 4.1 using `--board-options usb=serialmidiaudio`; Arduino CLI needs a temporary sketch folder named `SongBeam4C` with `SongBeam4C.ino`, `WavFormat.h`, `CaptureRing.h`, and `UsbFrame.h`. No firmware build or output from this repository should be flashed without a physical validation step and a known-good recovery image.
+
+## Experimental live USB capture
+
+The source tree includes a synthetic-tested four-channel USB Serial receiver, `songbeam-usb-capture`. It is **not yet verified with a physical USB stream** and does not turn the device into a standard four-channel USB microphone. Install the optional dependency with `uv sync --extra usb --locked`, then for a supervised bench run with the composite firmware:
+
+```sh
+uv run --extra usb songbeam-usb-capture /dev/ttyACM0 \
+  /path/to/data-drive/songbeam/raw/new-usb-test.wav \
+  --seconds 10 --require-mount /path/to/data-drive
+```
+
+The receiver sends `STREAM 4`, checks every sequence and CRC, sends `STOP`, and writes a new four-channel PCM16 WAV plus a manifest. A disconnect, reported drop, bad CRC or disk error leaves a `.partial.wav` and a failed manifest; it never inserts synthetic samples or overwrites a prior capture. Use the firmware's `STREAM 2` command on the Serial control port to activate a separate, provisional stereo USB Audio feed made from two microphone pairs. That stereo path has not yet passed a physical channel tap test. Keep raw four-channel SD or USB capture as the scientific master.
