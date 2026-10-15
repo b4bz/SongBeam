@@ -179,7 +179,9 @@ uint32_t lastSdErrorData = 0;
 
 void captureSdError() {
   lastSdErrorCode = SD.sdfs.sdErrorCode();
-  lastSdErrorData = SD.sdfs.sdErrorData();
+  // The SdFat convenience wrapper returns only 8 bits; SDIO error data is
+  // 32 bits, so retain the controller's complete diagnostic value.
+  lastSdErrorData = SD.sdfs.card() ? SD.sdfs.card()->errorData() : 0;
 }
 
 int PIN_POWER=32;
@@ -387,10 +389,14 @@ void handleUsbCommand(const char* command) {
   }
   if (strcmp(command, "STATUS") == 0) {
     Serial.print("SB FW MTP1 SD="); Serial.print(sdReady ? 1 : 0);
+    Serial.print(" ID="); Serial.print(devname);
+    Serial.print(" FILEMINS="); Serial.print(recmins);
     Serial.print(" RTC="); Serial.print(year() >= 2020 && year() <= 2100 ? 1 : 0);
+    Serial.print(" EPOCH="); Serial.print((uint32_t)Teensy3Clock.get());
     Serial.print(" FAILURES="); Serial.print(failedRecordings);
     Serial.print(" FATAL="); Serial.print(sdFatal ? 1 : 0);
     Serial.print(" SDERR="); Serial.print(lastSdErrorCode);
+    Serial.print(" SDDATA="); Serial.print(lastSdErrorData);
     Serial.print(" MODE="); Serial.println(static_cast<int>(usbMode));
   } else if (strcmp(command, "STREAM 4") == 0) {
     stopUsbMode(false);
@@ -676,6 +682,8 @@ void stopRecordingChannels(unsigned int channels, const char* filename) {
   Serial.print("Saved frames: "); Serial.println((uint32_t)savedFrames);
   Serial.print("SD write calls: "); Serial.println(sdWriteCalls);
   Serial.print("Worst SD write us: "); Serial.println(worstWriteMicros);
+  Serial.print("SD error code: "); Serial.println(lastSdErrorCode);
+  Serial.print("SD error data: "); Serial.println(lastSdErrorData);
   if (AudioMemoryUsageMax() >= audioPoolBlocks) Serial.println("Audio pool saturated");
   mode = 0;
 }
