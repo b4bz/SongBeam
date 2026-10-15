@@ -23,10 +23,10 @@ MAGIC = b"SB4C"
 VERSION = 1
 AUDIO = 0
 END = 1
-CHANNELS = 4
+STEREO = 2
 SAMPLE_RATE = 44_100
 FRAMES_PER_PACKET = 128
-PAYLOAD_BYTES = FRAMES_PER_PACKET * CHANNELS * 2
+PAYLOAD_BYTES = FRAMES_PER_PACKET * 4 * 2
 
 
 class StreamError(ValueError):
@@ -44,8 +44,11 @@ def read_exact(source: BinaryIO, size: int) -> bytes:
 
 
 class FrameReader:
-    def __init__(self, source: BinaryIO) -> None:
+    def __init__(self, source: BinaryIO, channels: int = 4) -> None:
+        if channels not in (2, 4):
+            raise ValueError("USB stream supports two or four channels")
         self.source = source
+        self.channels = channels
         self.next_sequence = 0
         self.frames = 0
         self.ended = False
@@ -68,9 +71,10 @@ class FrameReader:
                 raise StreamError("invalid end frame")
             self.ended = True
             return None
-        if kind != AUDIO or frames != FRAMES_PER_PACKET:
+        expected_kind = STEREO if self.channels == 2 else AUDIO
+        if kind != expected_kind or frames != FRAMES_PER_PACKET:
             raise StreamError("unsupported USB audio frame")
-        payload = read_exact(self.source, PAYLOAD_BYTES)
+        payload = read_exact(self.source, FRAMES_PER_PACKET * self.channels * 2)
         if zlib.crc32(payload) != checksum:
             raise StreamError("USB frame CRC mismatch")
         self.frames += frames
@@ -78,9 +82,7 @@ class FrameReader:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="Capture SongBeam four-channel USB PCM"
-    )
+    parser = argparse.ArgumentParser(description="Capture SongBeam USB PCM")
     parser.add_argument("port", help="USB Serial port, such as /dev/ttyACM0")
     parser.add_argument(
         "output", type=Path, help="new WAV path outside the source repository"
@@ -88,6 +90,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--seconds", type=float, required=True, help="positive capture duration"
     )
+    parser.add_argument("--channels", type=int, choices=(2, 4), default=4)
     parser.add_argument(
         "--require-mount", type=Path, help="fail unless output stays on this mount"
     )
@@ -109,7 +112,7 @@ def main(argv: list[str] | None = None) -> int:
         ):
             parser.error("output is on a different filesystem than the required mount")
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    expected_bytes = int(args.seconds * SAMPLE_RATE * CHANNELS * 2)
+    expected_bytes = int(args.seconds * SAMPLE_RATE * args.channels * 2)
     if shutil.disk_usage(args.output.parent).free < expected_bytes + 8 * (1024**3):
         parser.error("insufficient free space including the 8 GiB reserve")
     try:
@@ -122,23 +125,26 @@ def main(argv: list[str] | None = None) -> int:
     receiver: FrameReader | None = None
     try:
         with serial.Serial(args.port, timeout=2, write_timeout=2) as device:
-            device.write(b"STREAM 4\n")
+            device.write(f"STREAM {args.channels}\n".encode("ascii"))
+            expected_greeting = (
+                f"OK STREAM{args.channels} 44100 {args.channels} S16LE".encode("ascii")
+            )
             for _ in range(16):
                 greeting = device.readline().strip()
-                if greeting == b"OK STREAM4 44100 4 S16LE":
+                if greeting == expected_greeting:
                     break
             else:
                 raise StreamError(
-                    f"firmware did not accept STREAM 4: {greeting[:80]!r}"
+                    f"firmware did not accept stream mode: {greeting[:80]!r}"
                 )
-            receiver = FrameReader(device)
+            receiver = FrameReader(device, args.channels)
             with (
                 os.fdopen(
                     os.open(partial, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "wb"
                 ) as raw,
                 wave.open(raw, "wb") as wav,
             ):
-                wav.setnchannels(CHANNELS)
+                wav.setnchannels(args.channels)
                 wav.setsampwidth(2)
                 wav.setframerate(SAMPLE_RATE)
                 deadline = time.monotonic() + args.seconds
@@ -178,7 +184,7 @@ def main(argv: list[str] | None = None) -> int:
             "detail": detail,
             "protocol": "SB4C/1",
             "sample_rate": SAMPLE_RATE,
-            "channels": CHANNELS,
+            "channels": args.channels,
             "frames": receiver.frames if receiver else 0,
             "sha256": digest,
             "audio_file": path.name if path.exists() else None,

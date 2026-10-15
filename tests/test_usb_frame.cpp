@@ -25,5 +25,15 @@ int main() {
   assert(read32(header + 12) == 60000);
   assert(read32(header + 16) == 3);
   assert(read32(header + 20) == songbeam::crc32(payload, sizeof(payload)));
+
+  uint8_t stereo[songbeam::kUsbStereoPayloadBytes] = {};
+  // L=(1000+3000)/2=2000, R=(-1000-3000)/2=-2000.
+  songbeam::put16(payload, 0, 1000);
+  songbeam::put16(payload, 2, 3000);
+  songbeam::put16(payload, 4, uint16_t(int16_t(-1000)));
+  songbeam::put16(payload, 6, uint16_t(int16_t(-3000)));
+  songbeam::stereoPairSum128(payload, stereo);
+  assert(uint16_t(stereo[0] | (uint16_t(stereo[1]) << 8)) == 2000);
+  assert(int16_t(stereo[2] | (uint16_t(stereo[3]) << 8)) == -2000);
   return 0;
 }

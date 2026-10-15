@@ -3,6 +3,9 @@
 #include <SerialFlash.h>
 
 #include <Audio.h>
+#ifdef MTP_INTERFACE
+#include <MTP_Teensy.h>
+#endif
 #include <Wire.h>
 #include <TimeLib.h>
 #include <TimeAlarms.h>
@@ -114,21 +117,7 @@ AudioConnection patchCord2(audioInput, 1, capture, 1);
 AudioConnection patchCord3(audioInput2, 0, capture, 2);
 AudioConnection patchCord4(audioInput2, 1, capture, 3);
 
-#ifdef AUDIO_INTERFACE
-// Provisional PCB groups: A1/A2 use I2S1; A3/A4 use I2S2.  Verify physical
-// channel identity and enclosure orientation before treating L/R as calibrated.
-AudioMixer4 usbLeftMixer;
-AudioMixer4 usbRightMixer;
-AudioOutputUSB usbAudio;
-AudioConnection usbLeft0;
-AudioConnection usbLeft1;
-AudioConnection usbRight0;
-AudioConnection usbRight1;
-AudioConnection usbOutLeft(usbLeftMixer, 0, usbAudio, 0);
-AudioConnection usbOutRight(usbRightMixer, 0, usbAudio, 1);
-#endif
-
-enum class UsbMode : uint8_t { Idle, Raw4, Stereo2 };
+enum class UsbMode : uint8_t { Idle, Raw4, Stereo2, Card };
 UsbMode usbMode = UsbMode::Idle;
 char usbCommand[48] = {};
 uint8_t usbCommandLength = 0;
@@ -137,7 +126,10 @@ uint32_t usbStreamStartMillis = 0;
 uint32_t usbSentFrames = 0;
 bool usbWasConfigured = false;
 bool sdReady = false;
+bool mtpFilesystemAdded = false;
+bool cardModeNeedsReset = false;
 int autoRecordOnBoot = 1;
+uint8_t usbStereoBuffer[songbeam::kUsbStereoPayloadBytes] = {};
 
 
 int recDay[7]={1,1,1,1,1,1,1};
@@ -212,11 +204,8 @@ void setup() {
 
   
   AudioMemory(audioPoolBlocks);
-#ifdef AUDIO_INTERFACE
-  usbLeftMixer.gain(0, 0.5f);
-  usbLeftMixer.gain(1, 0.5f);
-  usbRightMixer.gain(0, 0.5f);
-  usbRightMixer.gain(1, 0.5f);
+#ifdef MTP_INTERFACE
+  MTP.begin();
 #endif
 
   sdReady = SD.sdfs.begin(SdioConfig(FIFO_SDIO));
@@ -313,11 +302,12 @@ void loop() {
     return;
   }
   if (usbWasConfigured) {
+    if (usbMode == UsbMode::Card) cardModeNeedsReset = true;
     stopUsbMode(false);
     usbWasConfigured = false;
   }
   set_arm_clock(idleClock);
-  if (!sdReady || year() < 2020 || year() > 2100) {
+  if (cardModeNeedsReset || !sdReady || year() < 2020 || year() > 2100) {
     digitalWrite(LED_BUILTIN, HIGH);
     delay(250);
     digitalWrite(LED_BUILTIN, LOW);
@@ -353,7 +343,7 @@ void loop() {
 }
 
 void stopUsbMode(bool sendEndFrame) {
-  if (usbMode == UsbMode::Raw4) {
+  if (usbMode == UsbMode::Raw4 || usbMode == UsbMode::Stereo2) {
     capture.end();
     const uint32_t undelivered = capture.ring.available();
     const uint32_t lost = capture.ring.droppedBlocks() +
@@ -366,23 +356,22 @@ void stopUsbMode(bool sendEndFrame) {
       Serial.write(header, sizeof(header));
     }
   }
-#ifdef AUDIO_INTERFACE
-  if (usbMode == UsbMode::Stereo2) {
-    AudioNoInterrupts();
-    usbLeft0.disconnect(); usbLeft1.disconnect();
-    usbRight0.disconnect(); usbRight1.disconnect();
-    AudioInterrupts();
-  }
-#endif
   usbMode = UsbMode::Idle;
   set_arm_clock(idleClock);
 }
 
 void handleUsbCommand(const char* command) {
-  if (usbMode == UsbMode::Raw4 && strcmp(command, "STOP") != 0) return;
+  if ((usbMode == UsbMode::Raw4 || usbMode == UsbMode::Stereo2) &&
+      strcmp(command, "STOP") != 0) return;
+  if (usbMode == UsbMode::Card && strcmp(command, "STATUS") != 0 &&
+      strncmp(command, "TIME ", 5) != 0) {
+    Serial.println("ERR card mode ends only after safe host eject and power cycle");
+    return;
+  }
   if (strcmp(command, "STATUS") == 0) {
-    Serial.print("SB FW USB1 SD="); Serial.print(sdReady ? 1 : 0);
+    Serial.print("SB FW MTP1 SD="); Serial.print(sdReady ? 1 : 0);
     Serial.print(" RTC="); Serial.print(year() >= 2020 && year() <= 2100 ? 1 : 0);
+    Serial.print(" FAILURES="); Serial.print(failedRecordings);
     Serial.print(" MODE="); Serial.println(static_cast<int>(usbMode));
   } else if (strcmp(command, "STREAM 4") == 0) {
     stopUsbMode(false);
@@ -395,24 +384,35 @@ void handleUsbCommand(const char* command) {
     usbMode = UsbMode::Raw4;
     Serial.println("OK STREAM4 44100 4 S16LE");
   } else if (strcmp(command, "STREAM 2") == 0) {
-#ifdef AUDIO_INTERFACE
     stopUsbMode(false);
     set_arm_clock(captureClock);
-    AudioNoInterrupts();
-    usbLeft0.connect(audioInput, 0, usbLeftMixer, 0);
-    usbLeft1.connect(audioInput, 1, usbLeftMixer, 1);
-    usbRight0.connect(audioInput2, 0, usbRightMixer, 0);
-    usbRight1.connect(audioInput2, 1, usbRightMixer, 1);
-    AudioInterrupts();
+    capture.begin(4);
+    AudioMemoryUsageMaxReset();
+    usbSequence = 0;
+    usbSentFrames = 0;
+    usbStreamStartMillis = millis();
     usbMode = UsbMode::Stereo2;
     Serial.println("OK STREAM2 44100 2 S16LE");
+  } else if (strcmp(command, "CARD") == 0) {
+#ifdef MTP_INTERFACE
+    if (!sdReady) { Serial.println("ERR SD unavailable"); return; }
+    stopUsbMode(false);
+    if (!mtpFilesystemAdded) {
+      if (!MTP.addFilesystem(SD, "SONGBEAM")) {
+        Serial.println("ERR MTP storage setup failed"); return;
+      }
+      mtpFilesystemAdded = true;
+    }
+    usbMode = UsbMode::Card;
+    MTP.reset();
+    Serial.println("OK CARD MTP");
 #else
-    Serial.println("ERR stereo USB audio not in this build");
+    Serial.println("ERR MTP not in this build");
 #endif
   } else if (strcmp(command, "STOP") == 0) {
-    const bool wasRaw4 = usbMode == UsbMode::Raw4;
+    const bool wasStream = usbMode == UsbMode::Raw4 || usbMode == UsbMode::Stereo2;
     stopUsbMode(true);
-    if (!wasRaw4) Serial.println("OK STOP");
+    if (!wasStream) Serial.println("OK STOP");
   } else if (strcmp(command, "RECORD 1") == 0) {
     if (!sdReady || year() < 2020 || year() > 2100) {
       Serial.println("ERR SD or RTC unavailable");
@@ -433,7 +433,7 @@ void handleUsbCommand(const char* command) {
     Teensy3Clock.set(epoch);
     setTime(epoch);
     Serial.println("OK TIME");
-  } else if (usbMode != UsbMode::Raw4) {
+  } else if (usbMode == UsbMode::Idle) {
     Serial.println("ERR unknown command");
   }
 }
@@ -453,7 +453,10 @@ void serviceUsb() {
       usbCommandLength = 0;
     }
   }
-  if (usbMode != UsbMode::Raw4) {
+  if (usbMode == UsbMode::Card || usbMode == UsbMode::Idle) {
+#ifdef MTP_INTERFACE
+    MTP.loop();
+#endif
     if (usbMode == UsbMode::Idle) delay(1);
     return;
   }
@@ -462,17 +465,24 @@ void serviceUsb() {
     return;
   }
   for (unsigned i = 0; i < 8 && capture.ring.available() > 0; ++i) {
-    if (Serial.availableForWrite() <
-        int(songbeam::kUsbFrameHeaderBytes + songbeam::kUsbFramePayloadBytes)) break;
+    const bool stereo = usbMode == UsbMode::Stereo2;
+    const size_t payloadBytes = stereo ? songbeam::kUsbStereoPayloadBytes :
+                                         songbeam::kUsbFramePayloadBytes;
+    if (Serial.availableForWrite() < int(songbeam::kUsbFrameHeaderBytes + payloadBytes)) break;
     const uint8_t* payload = capture.ring.front();
+    if (stereo) {
+      songbeam::stereoPairSum128(payload, usbStereoBuffer);
+      payload = usbStereoBuffer;
+    }
     uint8_t header[songbeam::kUsbFrameHeaderBytes];
-    songbeam::usbFrameHeader(header, songbeam::kUsbFrameAudio, 128,
+    songbeam::usbFrameHeader(header, stereo ? songbeam::kUsbFrameStereo :
+                                             songbeam::kUsbFrameAudio, 128,
                              usbSequence, millis() - usbStreamStartMillis,
                              capture.ring.droppedBlocks() + capture.missingInputBlocks,
-                             songbeam::crc32(payload, songbeam::kUsbFramePayloadBytes));
+                             songbeam::crc32(payload, payloadBytes));
     const size_t sentHeader = Serial.write(header, sizeof(header));
-    const size_t sentPayload = Serial.write(payload, songbeam::kUsbFramePayloadBytes);
-    if (sentHeader != sizeof(header) || sentPayload != songbeam::kUsbFramePayloadBytes) {
+    const size_t sentPayload = Serial.write(payload, payloadBytes);
+    if (sentHeader != sizeof(header) || sentPayload != payloadBytes) {
       stopUsbMode(false);  // host will reject the truncated frame
       return;
     }

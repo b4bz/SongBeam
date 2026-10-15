@@ -62,4 +62,4 @@ jobs:
           "$CLI" core install teensy:avr@1.62 --additional-urls "$URL"
           mkdir -p "$RUNNER_TEMP/SongBeam4C"
           cp code/SongBeam4C.ino code/WavFormat.h code/CaptureRing.h code/UsbFrame.h "$RUNNER_TEMP/SongBeam4C/"
-          "$CLI" compile --fqbn teensy:avr:teensy41 --board-options usb=serialmidiaudio --warnings all "$RUNNER_TEMP/SongBeam4C"
+          "$CLI" compile --fqbn teensy:avr:teensy41 --board-options usb=serialmtp --warnings all "$RUNNER_TEMP/SongBeam4C"
