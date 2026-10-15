@@ -16,6 +16,7 @@ usb = ["pyserial>=3.5,<4"]
 [project.scripts]
 songbeam = "songbeam.cli:main"
 songbeam-usb-capture = "songbeam.usb_capture:main"
+songbeam-usb-control = "songbeam.usb_control:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
