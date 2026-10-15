@@ -32,7 +32,7 @@ Reproducible checks: `uv sync --extra dev --locked` from this directory, then `u
 
 ## Experimental live USB capture
 
-The source tree includes a synthetic-tested USB Serial receiver, `songbeam-usb-capture`, for four raw channels or a stereo preview. It is **not yet verified with a physical USB stream** and does not turn the device into a standard USB microphone. Install the optional dependency with `uv sync --extra usb --locked`, then for a supervised bench run with the Serial + MTP firmware:
+The source tree includes a USB Serial receiver, `songbeam-usb-capture`, for four raw channels or a stereo preview. Eight-second physical transport captures passed with continuous sequence and CRC, but long-duration reliability and acoustic channel mapping remain unverified. It does not turn the device into a standard USB microphone. Install the optional dependency with `uv sync --extra usb --locked`, then for a supervised run with the Serial + MTP firmware:
 
 ```sh
 uv run --extra usb songbeam-usb-capture /dev/ttyACM0 \
@@ -40,4 +40,4 @@ uv run --extra usb songbeam-usb-capture /dev/ttyACM0 \
   --seconds 10 --require-mount /path/to/data-drive
 ```
 
-The receiver sends `STREAM 4` by default; add `--channels 2` to request the provisional left/right pair sums over the same Serial stream. It checks every sequence and CRC, sends `STOP`, and writes a new PCM16 WAV plus a manifest. A disconnect, reported drop, bad CRC or disk error leaves a `.partial.wav` and a failed manifest; it never inserts synthetic samples or overwrites a prior capture. The stereo path has not yet passed a physical channel tap test. `CARD` on the control port enables separate MTP card browsing after any recorder file has closed; safely finish/eject host transfers and power-cycle before SD recording. Keep raw four-channel SD or USB capture as the scientific master.
+The receiver sends `STREAM 4` by default; add `--channels 2` to request the provisional left/right pair sums over the same Serial stream. It checks every sequence and CRC, sends `STOP`, and writes a new PCM16 WAV plus a manifest. A disconnect, reported drop, bad CRC or disk error leaves a `.partial.wav` and a failed manifest; it never inserts synthetic samples or overwrites a prior capture. The stereo path has not yet passed a physical channel tap test. `CARD` on the control port enables separate MTP card browsing after any recorder file has closed; a short host read/write/delete test passed, but card integrity and longer transfers still need validation. Safely finish/eject host transfers and power-cycle before SD recording. Keep raw four-channel SD or USB capture as the scientific master.

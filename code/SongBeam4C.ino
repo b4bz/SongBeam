@@ -173,6 +173,13 @@ uint32_t recordStartMillis = 0;
 uint32_t preparationMillis = 0;
 uint32_t worstWriteMicros = 0;
 uint32_t sdWriteCalls = 0;
+uint8_t lastSdErrorCode = 0;
+uint32_t lastSdErrorData = 0;
+
+void captureSdError() {
+  lastSdErrorCode = SD.sdfs.sdErrorCode();
+  lastSdErrorData = SD.sdfs.sdErrorData();
+}
 
 int PIN_POWER=32;
 
@@ -214,6 +221,7 @@ void setup() {
     Serial.println("reading config file");
     readconfig();
   } else {
+    captureSdError();
     Serial.println("SD unavailable: USB streaming remains possible");
   }
   if (numChannels != 2 && numChannels != 4) numChannels = 4;
@@ -380,6 +388,7 @@ void handleUsbCommand(const char* command) {
     Serial.print("SB FW MTP1 SD="); Serial.print(sdReady ? 1 : 0);
     Serial.print(" RTC="); Serial.print(year() >= 2020 && year() <= 2100 ? 1 : 0);
     Serial.print(" FAILURES="); Serial.print(failedRecordings);
+    Serial.print(" SDERR="); Serial.print(lastSdErrorCode);
     Serial.print(" MODE="); Serial.println(static_cast<int>(usbMode));
   } else if (strcmp(command, "STREAM 4") == 0) {
     stopUsbMode(false);
@@ -534,6 +543,8 @@ char* startRecordingChannels(unsigned int channels) {
   const char* base = makeFilename();
   size_t stemLength = strlen(base) - strlen(postfix);
   recordingFailed = false;
+  lastSdErrorCode = 0;
+  lastSdErrorData = 0;
   mode = 0;
   for (unsigned int suffix = 0; suffix < 100; suffix++) {
     if (suffix == 0) snprintf(filename, sizeof(filename), "%s", base);
@@ -542,9 +553,15 @@ char* startRecordingChannels(unsigned int channels) {
     if (suffix == 99) { Serial.println("No unique recording filename"); recordingFailed = true; return nullptr; }
   }
   frec = SD.sdfs.open(filename, O_RDWR | O_CREAT | O_EXCL);
-  if (!frec) { Serial.println("Recording open failed"); recordingFailed = true; return nullptr; }
+  if (!frec) {
+    captureSdError();
+    Serial.print("Recording open failed; SD error code: "); Serial.println(lastSdErrorCode);
+    recordingFailed = true;
+    return nullptr;
+  }
   const uint64_t expected = 44ULL + (uint64_t)channels * 2ULL * sampleRate * 60ULL * (uint64_t)recmins;
   if (expected > 0xFFFFFFFFULL || !frec.preAllocate(expected) || !frec.seek(0)) {
+    captureSdError();
     Serial.println("Recording allocation failed");
     frec.close();
     recordingFailed = true;
@@ -552,6 +569,7 @@ char* startRecordingChannels(unsigned int channels) {
   }
   byte header[44] = {0};
   if (frec.write(header, sizeof(header)) != sizeof(header)) {
+    captureSdError();
     Serial.println("WAV header reserve failed");
     frec.close();
     recordingFailed = true;
@@ -583,7 +601,11 @@ void writeInterleavedBlocks(unsigned int channels, unsigned int requestedBlocks)
   ++sdWriteCalls;
   recByteSaved += written - written % (channels * 2U);
   if (written == wanted) capture.ring.consume(blocks);
-  if (written != wanted) { recordingFailed = true; Serial.println("Short SD audio write"); }
+  if (written != wanted) {
+    captureSdError();
+    recordingFailed = true;
+    Serial.print("Short SD audio write; SD error code: "); Serial.println(lastSdErrorCode);
+  }
 }
 
 void continueRecording() {
@@ -631,6 +653,8 @@ void stopRecordingChannels(unsigned int channels, const char* filename) {
       marker.print("DroppedRingBlocks="); marker.println(dropped);
       marker.print("MissingInputBlocks="); marker.println(missing);
       marker.print("WorstSDWriteUs="); marker.println(worstWriteMicros);
+      marker.print("SdErrorCode="); marker.println(lastSdErrorCode);
+      marker.print("SdErrorData="); marker.println(lastSdErrorData);
       marker.sync(); marker.close();
     }
     Serial.println("Recording incomplete: inspect WAV and .failed marker");
