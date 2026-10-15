@@ -139,6 +139,7 @@ int recDay[7]={1,1,1,1,1,1,1};
 int mode = 0;  // 0=stopped, 1=recording, 2=playing
 FsFile frec;
 bool recordingFailed = false;
+bool sdFatal = false;
 uint32_t failedRecordings = 0;
 uint32_t maxRingDepth = 0;
 elapsedMillis  msecs;
@@ -323,7 +324,7 @@ void loop() {
     usbWasConfigured = false;
   }
   set_arm_clock(idleClock);
-  if (cardModeNeedsReset || !sdReady || year() < 2020 || year() > 2100) {
+  if (cardModeNeedsReset || !sdReady || sdFatal || year() < 2020 || year() > 2100) {
     digitalWrite(LED_BUILTIN, HIGH);
     delay(250);
     digitalWrite(LED_BUILTIN, LOW);
@@ -388,6 +389,7 @@ void handleUsbCommand(const char* command) {
     Serial.print("SB FW MTP1 SD="); Serial.print(sdReady ? 1 : 0);
     Serial.print(" RTC="); Serial.print(year() >= 2020 && year() <= 2100 ? 1 : 0);
     Serial.print(" FAILURES="); Serial.print(failedRecordings);
+    Serial.print(" FATAL="); Serial.print(sdFatal ? 1 : 0);
     Serial.print(" SDERR="); Serial.print(lastSdErrorCode);
     Serial.print(" MODE="); Serial.println(static_cast<int>(usbMode));
   } else if (strcmp(command, "STREAM 4") == 0) {
@@ -431,7 +433,7 @@ void handleUsbCommand(const char* command) {
     stopUsbMode(true);
     if (!wasStream) Serial.println("OK STOP");
   } else if (strcmp(command, "RECORD 1") == 0) {
-    if (!sdReady || year() < 2020 || year() > 2100) {
+    if (!sdReady || sdFatal || year() < 2020 || year() > 2100) {
       Serial.println("ERR SD or RTC unavailable");
       return;
     }
@@ -557,6 +559,7 @@ char* startRecordingChannels(unsigned int channels) {
     captureSdError();
     Serial.print("Recording open failed; SD error code: "); Serial.println(lastSdErrorCode);
     recordingFailed = true;
+    sdFatal = true;
     return nullptr;
   }
   const uint64_t expected = 44ULL + (uint64_t)channels * 2ULL * sampleRate * 60ULL * (uint64_t)recmins;
@@ -565,6 +568,7 @@ char* startRecordingChannels(unsigned int channels) {
     Serial.println("Recording allocation failed");
     frec.close();
     recordingFailed = true;
+    sdFatal = true;
     return nullptr;
   }
   byte header[44] = {0};
@@ -573,6 +577,7 @@ char* startRecordingChannels(unsigned int channels) {
     Serial.println("WAV header reserve failed");
     frec.close();
     recordingFailed = true;
+    sdFatal = true;
     return nullptr;
   }
   capture.begin(channels);
@@ -604,6 +609,7 @@ void writeInterleavedBlocks(unsigned int channels, unsigned int requestedBlocks)
   if (written != wanted) {
     captureSdError();
     recordingFailed = true;
+    sdFatal = true;
     Serial.print("Short SD audio write; SD error code: "); Serial.println(lastSdErrorCode);
   }
 }
@@ -642,6 +648,7 @@ void stopRecordingChannels(unsigned int channels, const char* filename) {
   if (!writeOutHeader() || !frec.sync()) recordingFailed = true;
   frec.close();
   if (recordingFailed) {
+    sdFatal = true;
     ++failedRecordings;
     digitalWrite(LED_BUILTIN, HIGH);
     char failedName[64];

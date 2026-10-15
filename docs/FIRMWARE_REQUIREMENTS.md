@@ -25,6 +25,7 @@ On the reviewed PCB, microphones A1/A2 share one ADAU7002 and A3/A4 share the ot
 ## Integrity and field behavior
 
 - Keep SD recording and USB streaming separate until a concurrent stress test proves both can run without gaps. Never let host backpressure silently stall capture; report sequence gaps or fail the session.
+- Latch an SD open/allocation/write or capture-integrity failure for the current power session and stop autonomous retries. Keep USB status and MTP recovery access available; do not flood a failing card with new file attempts. Verify this behavior with an induced fault before field use.
 - Treat `CARD` as an exclusive, one-way mode until safe host eject and power cycle. The tested MTP implementation creates its own `mtpindex.dat` on the SD card even when the host only browses; do not describe that operation as strictly read-only.
 - Use a versioned packet header for the four-channel desktop stream: sync word, sequence, frame count, capture timestamp, PCM format and CRC. The receiver must detect gaps, reject bad packets, and mark incomplete files honestly. It must not insert invented samples or overwrite raw data.
 - Start the file-duration timer after open/preallocation and queue activation. Emit per-file preparation time, captured frames, maximum queue/audio-memory use, SD write count, worst write latency and the SD controller's error code/data when available. Treat audio-memory exhaustion or material frame shortfall as a failed capture; leave a `.failed` marker next to an incomplete WAV when the card still accepts writes.
