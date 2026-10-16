@@ -3,11 +3,19 @@
 #include <SerialFlash.h>
 
 #include <Audio.h>
+#ifdef MTP_INTERFACE
+#include <MTP_Teensy.h>
+#endif
 #include <Wire.h>
 #include <TimeLib.h>
 #include <TimeAlarms.h>
+#include <string.h>
+#include "CaptureRing.h"
+#include "UsbFrame.h"
+#include "WavFormat.h"
 
 extern "C" uint32_t set_arm_clock(uint32_t frequency);
+extern "C" volatile uint8_t usb_configuration;
 
 char postfix[5]=".wav";
 char devname[5]="R01_";
@@ -25,26 +33,104 @@ unsigned int blockAlign = numChannels*bitsPerSample/8;
 unsigned long Subchunk2Size = 0L;
 unsigned long recByteSaved = 0L;
 unsigned long NumSamples = 0L;
-byte byte1, byte2, byte3, byte4;
 
-AudioInputI2S            audioInput;
-AudioRecordQueue         queue1;
-AudioRecordQueue         queue2;         //xy=389,145
-AudioInputI2S2           audioInput2;
-AudioRecordQueue         queue1a;
-AudioRecordQueue         queue2a;         //xy=389,145
+// The audio interrupt copies complete interleaved blocks into RAM2.  The SD
+// writer can then stall without holding AudioRecordQueue blocks or losing the
+// four channels' alignment.  384 KiB provides about 1.11 s at four channels.
+static DMAMEM __attribute__((aligned(32))) uint8_t captureStorage[384 * 1024];
 
-AudioConnection          patchCord1(audioInput, 0, queue1, 0);
-AudioConnection          patchCord2(audioInput, 1, queue2, 0);
-AudioConnection          patchCord3(audioInput2, 0, queue1a, 0);
-AudioConnection          patchCord4(audioInput2, 1, queue2a, 0);
-//recod from mic
+class AudioCaptureRing : public AudioStream {
+ public:
+  AudioCaptureRing() : AudioStream(4, inputQueueArray),
+                       ring(captureStorage, sizeof(captureStorage)) {}
 
+  void begin(uint16_t channels) {
+    AudioNoInterrupts();
+    clearPending();
+    ring.reset(channels);
+    missingInputBlocks = 0;
+    channels_ = channels;
+    enabled_ = true;
+    AudioInterrupts();
+  }
 
-byte bufferL[256];
-byte bufferR[256];
-byte bufferLa[256];
-byte bufferRa[256];
+  void end() {
+    AudioNoInterrupts();
+    enabled_ = false;
+    for (unsigned ch = 0; ch < channels_; ++ch)
+      if (pendingCount[ch] > 0) ++missingInputBlocks;
+    clearPending();
+    AudioInterrupts();
+  }
+
+  void update() override {
+    for (unsigned ch = 0; ch < 4; ++ch) {
+      audio_block_t* block = receiveReadOnly(ch);
+      if (!block) continue;
+      if (!enabled_ || ch >= channels_) {
+        release(block);
+      } else if (pendingCount[ch] == 4) {
+        ++missingInputBlocks;
+        release(block);
+      } else {
+        pending[ch][pendingCount[ch]++] = block;
+      }
+    }
+    if (!enabled_) return;
+    for (unsigned ch = 0; ch < channels_; ++ch)
+      if (pendingCount[ch] == 0) return;
+
+    const uint8_t* inputs[4] = {};
+    for (unsigned ch = 0; ch < channels_; ++ch)
+      inputs[ch] = reinterpret_cast<const uint8_t*>(pending[ch][0]->data);
+    ring.push(inputs);
+    for (unsigned ch = 0; ch < channels_; ++ch) {
+      release(pending[ch][0]);
+      for (unsigned i = 1; i < pendingCount[ch]; ++i)
+        pending[ch][i - 1] = pending[ch][i];
+      --pendingCount[ch];
+    }
+  }
+
+  songbeam::CaptureRing ring;
+  volatile uint32_t missingInputBlocks = 0;
+
+ private:
+  void clearPending() {
+    for (unsigned ch = 0; ch < 4; ++ch) {
+      for (unsigned i = 0; i < pendingCount[ch]; ++i) release(pending[ch][i]);
+      pendingCount[ch] = 0;
+    }
+  }
+  audio_block_t* inputQueueArray[4];
+  audio_block_t* pending[4][4] = {};
+  uint8_t pendingCount[4] = {};
+  uint16_t channels_ = 4;
+  bool enabled_ = false;
+};
+
+AudioInputI2S audioInput;
+AudioInputI2S2 audioInput2;
+AudioCaptureRing capture;
+AudioConnection patchCord1(audioInput, 0, capture, 0);
+AudioConnection patchCord2(audioInput, 1, capture, 1);
+AudioConnection patchCord3(audioInput2, 0, capture, 2);
+AudioConnection patchCord4(audioInput2, 1, capture, 3);
+
+enum class UsbMode : uint8_t { Idle, Raw4, Stereo2, Card };
+UsbMode usbMode = UsbMode::Idle;
+char usbCommand[48] = {};
+uint8_t usbCommandLength = 0;
+uint32_t usbSequence = 0;
+uint32_t usbStreamStartMillis = 0;
+uint32_t usbSentFrames = 0;
+bool usbWasConfigured = false;
+bool sdReady = false;
+bool mtpFilesystemAdded = false;
+bool cardModeNeedsReset = false;
+int autoRecordOnBoot = 1;
+uint8_t usbStereoBuffer[songbeam::kUsbStereoPayloadBytes] = {};
+uint32_t setupCompleteMillis = 0;
 
 
 int recDay[7]={1,1,1,1,1,1,1};
@@ -52,7 +138,10 @@ int recDay[7]={1,1,1,1,1,1,1};
 
 int mode = 0;  // 0=stopped, 1=recording, 2=playing
 FsFile frec;
-File frec2;
+bool recordingFailed = false;
+bool sdFatal = false;
+uint32_t failedRecordings = 0;
+uint32_t maxRingDepth = 0;
 elapsedMillis  msecs;
 
 int filecount=0;
@@ -75,16 +164,52 @@ int resistChoice=0;
 int recordPeriodMins=180;
 
 //int hiclock=450000000;
-int hiclock=24000000;
+// Use the fast clock while moving four synchronized channels to SD.  The
+// previous 24 MHz setting is retained for idle time to limit battery draw.
+constexpr uint32_t captureClock = 150000000;
+constexpr uint32_t idleClock = 24000000;
+constexpr unsigned int audioPoolBlocks = 64;
+constexpr int writeBatchBlocks = 8;
+uint32_t recordStartMillis = 0;
+uint32_t preparationMillis = 0;
+uint32_t worstWriteMicros = 0;
+uint32_t sdWriteCalls = 0;
+uint8_t lastSdErrorCode = 0;
+uint32_t lastSdErrorData = 0;
+
+void captureSdError() {
+  lastSdErrorCode = SD.sdfs.sdErrorCode();
+  // The SdFat convenience wrapper returns only 8 bits; SDIO error data is
+  // 32 bits, so retain the controller's complete diagnostic value.
+  lastSdErrorData = SD.sdfs.card() ? SD.sdfs.card()->errorData() : 0;
+}
+
+uint32_t backupRtcEpoch() {
+  // SNVS low-power RTC is the clock maintained by VBAT. Read a stable pair
+  // so STATUS can distinguish lost backup time from high-power RTC sync.
+  uint32_t high = SNVS_LPSRTCMR;
+  uint32_t low = SNVS_LPSRTCLR;
+  while (true) {
+    const uint32_t nextHigh = SNVS_LPSRTCMR;
+    const uint32_t nextLow = SNVS_LPSRTCLR;
+    if (high == nextHigh && low == nextLow)
+      return (nextHigh << 17) | (nextLow >> 15);
+    high = nextHigh;
+    low = nextLow;
+  }
+}
 
 int PIN_POWER=32;
 
 #define SDCARD_CS_PIN    BUILTIN_SDCARD
 
+void serviceUsb();
+void stopUsbMode(bool sendEndFrame);
+
 
 void setup() {
 
-  set_arm_clock(hiclock);
+  set_arm_clock(idleClock);
 
   
   Serial.begin(9600);
@@ -104,19 +229,26 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
 
   
-  AudioMemory(120);
-  
-  if (!(SD.sdfs.begin(SdioConfig(FIFO_SDIO)))) {
-    // stop here, but print a message repetitively
-    while (1) {
-      digitalWrite(LED_BUILTIN, HIGH);   // turn the LED on (HIGH is the voltage level)
-      delay(250);               // wait for a second
-      digitalWrite(LED_BUILTIN, LOW);    // turn the LED off by making the voltage LOW
-      delay(250);
-    }
+  AudioMemory(audioPoolBlocks);
+#ifdef MTP_INTERFACE
+  MTP.begin();
+#endif
+
+  sdReady = SD.sdfs.begin(SdioConfig(FIFO_SDIO));
+  if (sdReady) {
+    Serial.println("reading config file");
+    readconfig();
+  } else {
+    captureSdError();
+    Serial.println("SD unavailable: USB streaming remains possible");
   }
-  Serial.println("reading config file");
-  readconfig();
+  if (numChannels != 2 && numChannels != 4) numChannels = 4;
+  if (recmins < 1 || recmins > 120) recmins = 15;
+  if (recordPeriodMins < 1 || recordPeriodMins > 1440) recordPeriodMins = 180;
+  if (starttimehour < 0 || starttimehour > 23) starttimehour = 7;
+  if (starttimemin < 0 || starttimemin > 59) starttimemin = 0;
+  blockAlign = numChannels * (bitsPerSample / 8);
+  byteRate = sampleRate * blockAlign;
 
   if (numChannels==2){
     PIN_POWER=32;
@@ -124,11 +256,14 @@ void setup() {
   
   pinMode(PIN_POWER, OUTPUT);
   digitalWrite(PIN_POWER, LOW);
+  if (year() < 2020 || year() > 2100) {
+    Serial.println("Invalid RTC: recording disabled");
+  }
 
   Serial.println(devname);
   Serial.println(starttimemin);
   Serial.println(starttimehour);
-  Serial.println(recmins);\
+  Serial.println(recmins);
   Serial.println(recordPeriodMins);
   Serial.println(numChannels);
   for (int i=0; i<7; i++){Serial.println(recDay[i]);}
@@ -153,7 +288,6 @@ void setup() {
 
   Serial.println("WEEKDAY:");
   Serial.println(tm.Wday);
-  int day=tm.Wday-1;
 
   
   begintime=makeTime(tm);
@@ -161,12 +295,6 @@ void setup() {
   
  time_t x=now();
  offtime=x+ontime;
-  
-  if ((recDay[day]==0)||(x>endtime)||(offtime-60<begintime)){
-    digitalWrite(PIN_POWER, HIGH);
-    Serial.println("SHUTDOWN");
-  }
-
   offtime=offtime-(recmins+1)*60;
 
   Serial.println(x);
@@ -175,6 +303,7 @@ void setup() {
   
   //set_arm_clock(hiclock);
   delay(1000);
+  setupCompleteMillis = millis();
 }
 
 /*
@@ -195,350 +324,406 @@ void loops(){
 }
 */
 void loop() {
-  set_arm_clock(hiclock);
-  int x=now();
-  //Serial.print("New loop: ");
-  //Serial.println(x);
-  if ((x>begintime)&&(x<endtime)){
-    //Serial.println("Considering recording");
-    
-    //set_arm_clock(hiclock);
-    if (x>offtime){
-      int p=tsamplemillis-1000*(x-offtime);
-      if (p>10000){
-        recordSimple(p);
-      }
-      else{
-        digitalWrite(PIN_POWER, HIGH);
-        delay(1000);
-      }
-    }
-    else{
-      recordSimple(tsamplemillis);
-    }
+  if (usb_configuration) {
+    usbWasConfigured = true;
+    serviceUsb();
+    return;
   }
-  else if (x>endtime){
-    //Serial.println("Decided to turn off");
+  // A connected host can take time to enumerate. Give it the USB control
+  // path before autonomous mode opens an SD file.
+  if (!usbWasConfigured && millis() - setupCompleteMillis < 3000U) {
+    delay(10);
+    return;
+  }
+  if (usbWasConfigured) {
+    if (usbMode == UsbMode::Card) cardModeNeedsReset = true;
+    stopUsbMode(false);
+    usbWasConfigured = false;
+  }
+  set_arm_clock(idleClock);
+  if (cardModeNeedsReset || !sdReady || sdFatal || year() < 2020 || year() > 2100) {
+    digitalWrite(LED_BUILTIN, HIGH);
+    delay(250);
+    digitalWrite(LED_BUILTIN, LOW);
+    delay(750);
+    return;
+  }
+  const time_t x = now();
+  if (x >= offtime) {
     digitalWrite(PIN_POWER, HIGH);
     delay(1000);
+    return;
   }
-  else{
-    //Serial.println("waiting to start");
-    //set_arm_clock(loclock);
+  if (autoRecordOnBoot) {
+    numChannels = 4;
+    const uint32_t remainingMillis = uint32_t(offtime - x) * 1000U;
+    if (remainingMillis > 10000U)
+      recordSimple(remainingMillis < tsamplemillis ? remainingMillis : tsamplemillis, true);
+    else {
+      digitalWrite(PIN_POWER, HIGH);
+      delay(1000);
+    }
+    return;
+  }
+  const int day = weekday(x) - 1;
+  if (recDay[day] == 0 || x >= endtime) {
+    digitalWrite(PIN_POWER, HIGH);
+    delay(1000);
+  } else if (x > begintime) {
+    recordSimple(tsamplemillis, true);
+  } else {
     delay(1000);
   }
 }
 
-void recordSimple(int ts){
-  //set_arm_clock(hiclock);
+void stopUsbMode(bool sendEndFrame) {
+  if (usbMode == UsbMode::Raw4 || usbMode == UsbMode::Stereo2) {
+    capture.end();
+    const uint32_t undelivered = capture.ring.available();
+    const uint32_t lost = capture.ring.droppedBlocks() +
+                          capture.missingInputBlocks + undelivered;
+    if (sendEndFrame && Serial.dtr()) {
+      uint8_t header[songbeam::kUsbFrameHeaderBytes];
+      songbeam::usbFrameHeader(header, songbeam::kUsbFrameEnd, 0,
+                               usbSequence, millis() - usbStreamStartMillis,
+                               lost, 0);
+      Serial.write(header, sizeof(header));
+    }
+  }
+  usbMode = UsbMode::Idle;
+  set_arm_clock(idleClock);
+}
+
+void handleUsbCommand(const char* command) {
+  if ((usbMode == UsbMode::Raw4 || usbMode == UsbMode::Stereo2) &&
+      strcmp(command, "STOP") != 0) return;
+  if (usbMode == UsbMode::Card && strcmp(command, "STATUS") != 0 &&
+      strncmp(command, "TIME ", 5) != 0) {
+    Serial.println("ERR card mode ends only after safe host eject and power cycle");
+    return;
+  }
+  if (strcmp(command, "STATUS") == 0) {
+    Serial.print("SB FW MTP1 SD="); Serial.print(sdReady ? 1 : 0);
+    Serial.print(" ID="); Serial.print(devname);
+    Serial.print(" FILEMINS="); Serial.print(recmins);
+    Serial.print(" RTC="); Serial.print(year() >= 2020 && year() <= 2100 ? 1 : 0);
+    Serial.print(" EPOCH="); Serial.print((uint32_t)Teensy3Clock.get());
+    Serial.print(" BACKUPEPOCH="); Serial.print(backupRtcEpoch());
+    Serial.print(" BACKUPRUN="); Serial.print((SNVS_LPCR & SNVS_LPCR_SRTC_ENV) ? 1 : 0);
+    Serial.print(" FAILURES="); Serial.print(failedRecordings);
+    Serial.print(" FATAL="); Serial.print(sdFatal ? 1 : 0);
+    Serial.print(" SDERR="); Serial.print(lastSdErrorCode);
+    Serial.print(" SDDATA="); Serial.print(lastSdErrorData);
+    Serial.print(" MODE="); Serial.println(static_cast<int>(usbMode));
+  } else if (strcmp(command, "STREAM 4") == 0) {
+    stopUsbMode(false);
+    set_arm_clock(captureClock);
+    capture.begin(4);
+    AudioMemoryUsageMaxReset();
+    usbSequence = 0;
+    usbSentFrames = 0;
+    usbStreamStartMillis = millis();
+    usbMode = UsbMode::Raw4;
+    Serial.println("OK STREAM4 44100 4 S16LE");
+  } else if (strcmp(command, "STREAM 2") == 0) {
+    stopUsbMode(false);
+    set_arm_clock(captureClock);
+    capture.begin(4);
+    AudioMemoryUsageMaxReset();
+    usbSequence = 0;
+    usbSentFrames = 0;
+    usbStreamStartMillis = millis();
+    usbMode = UsbMode::Stereo2;
+    Serial.println("OK STREAM2 44100 2 S16LE");
+  } else if (strcmp(command, "CARD") == 0) {
+#ifdef MTP_INTERFACE
+    if (!sdReady) { Serial.println("ERR SD unavailable"); return; }
+    stopUsbMode(false);
+    if (!mtpFilesystemAdded) {
+      if (!MTP.addFilesystem(SD, "SONGBEAM")) {
+        Serial.println("ERR MTP storage setup failed"); return;
+      }
+      mtpFilesystemAdded = true;
+    }
+    usbMode = UsbMode::Card;
+    MTP.reset();
+    Serial.println("OK CARD MTP");
+#else
+    Serial.println("ERR MTP not in this build");
+#endif
+  } else if (strcmp(command, "STOP") == 0) {
+    const bool wasStream = usbMode == UsbMode::Raw4 || usbMode == UsbMode::Stereo2;
+    stopUsbMode(true);
+    if (!wasStream) Serial.println("OK STOP");
+  } else if (strcmp(command, "RECORD 1") == 0) {
+    if (!sdReady || sdFatal || year() < 2020 || year() > 2100) {
+      Serial.println("ERR SD or RTC unavailable");
+      return;
+    }
+    stopUsbMode(false);
+    numChannels = 4;
+    Serial.println("OK RECORD 1");
+    recordSimple(tsamplemillis, false);  // one bounded file, then USB-controlled idle
+    Serial.println(recordingFailed ? "ERR RECORD INCOMPLETE" : "OK RECORD DONE");
+  } else if (strncmp(command, "TIME ", 5) == 0) {
+    char* end = nullptr;
+    const unsigned long epoch = strtoul(command + 5, &end, 10);
+    if (!end || *end || epoch < 1577836800UL || epoch > 4102444800UL) {
+      Serial.println("ERR invalid UTC epoch");
+      return;
+    }
+    Teensy3Clock.set(epoch);
+    setTime(epoch);
+    Serial.println("OK TIME");
+  } else if (usbMode == UsbMode::Idle) {
+    Serial.println("ERR unknown command");
+  }
+}
+
+void serviceUsb() {
+  for (unsigned i = 0; i < 32 && Serial.available() > 0; ++i) {
+    const int received = Serial.read();
+    if (received == '\r') continue;
+    if (received == '\n') {
+      usbCommand[usbCommandLength] = '\0';
+      handleUsbCommand(usbCommand);
+      usbCommandLength = 0;
+    } else if (received >= 32 && received <= 126 &&
+               usbCommandLength < sizeof(usbCommand) - 1) {
+      usbCommand[usbCommandLength++] = static_cast<char>(received);
+    } else {
+      usbCommandLength = 0;
+    }
+  }
+  if (usbMode == UsbMode::Card || usbMode == UsbMode::Idle) {
+#ifdef MTP_INTERFACE
+    MTP.loop();
+#endif
+    if (usbMode == UsbMode::Idle) delay(1);
+    return;
+  }
+  if (!Serial.dtr()) {
+    stopUsbMode(false);
+    return;
+  }
+  for (unsigned i = 0; i < 8 && capture.ring.available() > 0; ++i) {
+    const bool stereo = usbMode == UsbMode::Stereo2;
+    const size_t payloadBytes = stereo ? songbeam::kUsbStereoPayloadBytes :
+                                         songbeam::kUsbFramePayloadBytes;
+    if (Serial.availableForWrite() < int(songbeam::kUsbFrameHeaderBytes + payloadBytes)) break;
+    const uint8_t* payload = capture.ring.front();
+    if (stereo) {
+      songbeam::stereoPairSum128(payload, usbStereoBuffer);
+      payload = usbStereoBuffer;
+    }
+    uint8_t header[songbeam::kUsbFrameHeaderBytes];
+    songbeam::usbFrameHeader(header, stereo ? songbeam::kUsbFrameStereo :
+                                             songbeam::kUsbFrameAudio, 128,
+                             usbSequence, millis() - usbStreamStartMillis,
+                             capture.ring.droppedBlocks() + capture.missingInputBlocks,
+                             songbeam::crc32(payload, payloadBytes));
+    const size_t sentHeader = Serial.write(header, sizeof(header));
+    const size_t sentPayload = Serial.write(payload, payloadBytes);
+    if (sentHeader != sizeof(header) || sentPayload != payloadBytes) {
+      stopUsbMode(false);  // host will reject the truncated frame
+      return;
+    }
+    capture.ring.consume(1);
+    ++usbSequence;
+    usbSentFrames += 128;
+  }
+}
+
+void recordSimple(unsigned long ts, bool stopWhenUsbAppears){
+  set_arm_clock(captureClock);
   delay(500);
-  //Serial.println("Recording ");
-  //Serial.println(now());
-  elapsedMillis recordingTime = 0;
   if (numChannels==2){
     char* fn=startRecording2Chan();
-    while(recordingTime<ts) continueRecording2Chan();
-    stopRecording2Chan(fn);
+    if (fn) {
+      // Starting the timer before preAllocate() shortened real recordings by
+      // the card's variable allocation latency (1.14 s in the bench run).
+      elapsedMillis recordingTime = 0;
+      while(recordingTime<ts && !recordingFailed && mode == 1 &&
+            (!stopWhenUsbAppears || !usb_configuration)) continueRecording2Chan();
+      stopRecording2Chan(fn);
+    }
   }
   else{
     char* fn=startRecording();  
-    while(recordingTime<ts) continueRecording();
-    stopRecording(fn);
+    if (fn) {
+      elapsedMillis recordingTime = 0;
+      while(recordingTime<ts && !recordingFailed && mode == 1 &&
+            (!stopWhenUsbAppears || !usb_configuration)) continueRecording();
+      stopRecording(fn);
+    }
   }
+  set_arm_clock(idleClock);
   delay(1000);
 }
 
 
-char* startRecording() {
-  Serial.println("startRecording");
-  filecount++;
-
-  char *filename = makeFilename();
-
-  if (SD.exists(filename)) {
-    SD.remove(filename);
+char* startRecordingChannels(unsigned int channels) {
+  static char filename[48];
+  const uint32_t prepareStart = millis();
+  const char* base = makeFilename();
+  size_t stemLength = strlen(base) - strlen(postfix);
+  recordingFailed = false;
+  lastSdErrorCode = 0;
+  lastSdErrorData = 0;
+  mode = 0;
+  for (unsigned int suffix = 0; suffix < 100; suffix++) {
+    if (suffix == 0) snprintf(filename, sizeof(filename), "%s", base);
+    else snprintf(filename, sizeof(filename), "%.*s_%02u%s", (int)stemLength, base, suffix, postfix);
+    if (!SD.exists(filename)) break;
+    if (suffix == 99) { Serial.println("No unique recording filename"); recordingFailed = true; return nullptr; }
   }
-  frec = SD.sdfs.open(filename, O_WRITE | O_CREAT);
-  int FILE_SIZE=4*60*recmins*44100*2*2;
-
-  if (!frec.preAllocate(FILE_SIZE)) {
-     Serial.println("preAllocate failed\n");
-     
+  frec = SD.sdfs.open(filename, O_RDWR | O_CREAT | O_EXCL);
+  if (!frec) {
+    captureSdError();
+    Serial.print("Recording open failed; SD error code: "); Serial.println(lastSdErrorCode);
+    recordingFailed = true;
+    sdFatal = true;
+    return nullptr;
   }
-  //Serial.print("File opened ");
-  //Serial.println(now());
-  
-  if (frec) {
-    queue1.begin();
-    queue2.begin();
-    queue1a.begin();
-    queue2a.begin();
-    mode = 1;
-    recByteSaved = 0L;
+  const uint64_t expected = 44ULL + (uint64_t)channels * 2ULL * sampleRate * 60ULL * (uint64_t)recmins;
+  if (expected > 0xFFFFFFFFULL || !frec.preAllocate(expected) || !frec.seek(0)) {
+    captureSdError();
+    Serial.println("Recording allocation failed");
+    frec.close();
+    recordingFailed = true;
+    sdFatal = true;
+    return nullptr;
   }
-
+  byte header[44] = {0};
+  if (frec.write(header, sizeof(header)) != sizeof(header)) {
+    captureSdError();
+    Serial.println("WAV header reserve failed");
+    frec.close();
+    recordingFailed = true;
+    sdFatal = true;
+    return nullptr;
+  }
+  capture.begin(channels);
+  AudioMemoryUsageMaxReset();
+  recordStartMillis = millis();
+  preparationMillis = recordStartMillis - prepareStart;
+  worstWriteMicros = 0;
+  sdWriteCalls = 0;
+  mode = 1;
+  recByteSaved = 0;
+  maxRingDepth = 0;
   return filename;
 }
 
-char* startRecording2Chan() {
-  Serial.println("startRecording");
-  filecount++;
+char* startRecording() { return startRecordingChannels(4); }
+char* startRecording2Chan() { return startRecordingChannels(2); }
 
-  char *filename = makeFilename();
-
-  if (SD.exists(filename)) {
-    SD.remove(filename);
+void writeInterleavedBlocks(unsigned int channels, unsigned int requestedBlocks) {
+  const uint32_t blocks = capture.ring.contiguous(requestedBlocks);
+  if (blocks == 0) return;
+  const size_t wanted = blocks * capture.ring.blockBytes();
+  const uint32_t writeStart = micros();
+  const size_t written = frec.write(capture.ring.front(), wanted);
+  const uint32_t writeMicros = micros() - writeStart;
+  if (writeMicros > worstWriteMicros) worstWriteMicros = writeMicros;
+  ++sdWriteCalls;
+  recByteSaved += written - written % (channels * 2U);
+  if (written == wanted) capture.ring.consume(blocks);
+  if (written != wanted) {
+    captureSdError();
+    recordingFailed = true;
+    sdFatal = true;
+    Serial.print("Short SD audio write; SD error code: "); Serial.println(lastSdErrorCode);
   }
-  frec = SD.sdfs.open(filename, O_WRITE | O_CREAT);
-  int FILE_SIZE=2*60*recmins*44100*2*2;
-
-  if (!frec.preAllocate(FILE_SIZE)) {
-     Serial.println("preAllocate failed\n");
-     
-  }
-  //Serial.print("File opened ");
-  //Serial.println(now());
-  
-  if (frec) {
-    queue1.begin();
-    queue2.begin();
-    mode = 1;
-    recByteSaved = 0L;
-  }
-
-  return filename;
 }
 
 void continueRecording() {
-
-  if (queue1.available() >= 2 && queue2.available() >= 2 && queue1a.available() >=2 && queue2a.available() >=2) {
-    byte buffer[1024];
-
-    memcpy(bufferL, queue1.readBuffer(), 256);
-    memcpy(bufferR, queue2.readBuffer(), 256);
-    memcpy(bufferLa, queue1a.readBuffer(), 256);
-    memcpy(bufferRa, queue2a.readBuffer(), 256);
-    queue1.freeBuffer();
-    queue2.freeBuffer();
-    queue1a.freeBuffer();
-    queue2a.freeBuffer();
-    int b = 0;
-    for (int i = 0; i < 1024; i += 8) {
-      buffer[i] = bufferL[b];
-      buffer[i + 1] = bufferL[b + 1];
-      buffer[i + 2] = bufferR[b];
-      buffer[i + 3] = bufferR[b + 1];
-      buffer[i+4] = bufferLa[b];
-      buffer[i + 5] = bufferLa[b + 1];
-      buffer[i + 6] = bufferRa[b];
-      buffer[i + 7] = bufferRa[b + 1];
-      b = b+2;
-    }
-    //elapsedMicros usec = 0;
-    frec.write(buffer, 1024);  //256 or 512 (dudes code)
-    recByteSaved += 1024;
-    ////Serial.print("SD write, us=");
-    ////Serial.println(usec);
-  } 
+  const uint32_t depth = capture.ring.available();
+  if (depth > maxRingDepth) maxRingDepth = depth;
+  if (depth >= writeBatchBlocks) writeInterleavedBlocks(4, writeBatchBlocks);
 }
 
 void continueRecording2Chan() {
-
-  if (queue1.available() >= 2 && queue2.available() >= 2) {
-    byte buffer[512];
-
-    memcpy(bufferL, queue1.readBuffer(), 256);
-    memcpy(bufferR, queue2.readBuffer(), 256);
-    
-    queue1.freeBuffer();
-    queue2.freeBuffer();
-
-    int b = 0;
-    for (int i = 0; i < 512; i += 4) {
-      buffer[i] = bufferL[b];
-      buffer[i + 1] = bufferL[b + 1];
-      buffer[i + 2] = bufferR[b];
-      buffer[i + 3] = bufferR[b + 1];
-      b = b+2;
-    }
-    //elapsedMicros usec = 0;
-    frec.write(buffer, 512);  //256 or 512 (dudes code)
-    recByteSaved += 512;
-    ////Serial.print("SD write, us=");
-    ////Serial.println(usec);
-  } 
+  const uint32_t depth = capture.ring.available();
+  if (depth > maxRingDepth) maxRingDepth = depth;
+  if (depth >= writeBatchBlocks) writeInterleavedBlocks(2, writeBatchBlocks);
 }
 
-void stopRecording(char* fn) {
-  //Serial.print("stopRecording ");
-  //Serial.println(now());
-  queue1.end();
-  queue2.end();
-  queue1a.end();
-  queue2a.end();
-  if (mode == 1) {
-    while (queue1.available() > 0 && queue2.available() > 0 && queue1a.available() > 0 && queue2a.available() > 0) {
-      frec.write((byte*)queue1.readBuffer(), 256);
-      queue1.freeBuffer();
-      frec.write((byte*)queue2.readBuffer(), 256);
-      queue2.freeBuffer();
-      frec.write((byte*)queue1a.readBuffer(), 256);
-      queue1a.freeBuffer();
-      frec.write((byte*)queue2a.readBuffer(), 256);
-      queue2a.freeBuffer();
-      recByteSaved += 256;
-    }
-    frec.truncate();
-    frec.close();
-    delay(100);
-
-
-    frec2 = SD.open(fn, FILE_WRITE);
-    //frec = SD.sdfs.open(fn, O_WRITE | O_CREAT);
-    
-    writeOutHeader();
-    frec2.close();
+void stopRecordingChannels(unsigned int channels, const char* filename) {
+  capture.end();
+  if (mode != 1) return;
+  const uint32_t captureMillis = millis() - recordStartMillis;
+  while (!recordingFailed && capture.ring.available() > 0)
+    writeInterleavedBlocks(channels, writeBatchBlocks);
+  const uint32_t dropped = capture.ring.droppedBlocks();
+  const uint32_t missing = capture.missingInputBlocks;
+  if (dropped || missing) {
+    recordingFailed = true;
+    Serial.println("Capture ring overflow or missing microphone block");
   }
-  mode = 0;
-  //Serial.print("finishedRecording ");
-  //Serial.println(now());
-}
-
-void stopRecording2Chan(char* fn) {
-  //Serial.print("stopRecording ");
-  //Serial.println(now());
-  queue1.end();
-  queue2.end();
-  if (mode == 1) {
-    while (queue1.available() > 0 && queue2.available() > 0) {
-      frec.write((byte*)queue1.readBuffer(), 256);
-      queue1.freeBuffer();
-      frec.write((byte*)queue2.readBuffer(), 256);
-      queue2.freeBuffer();
-      recByteSaved += 256;
-    }
-    frec.truncate();
-    frec.close();
-    delay(100);
-
-
-    frec2 = SD.open(fn, FILE_WRITE);
-    //frec = SD.sdfs.open(fn, O_WRITE | O_CREAT);
-    
-    writeOutHeader();
-    frec2.close();
+  const uint64_t expectedFrames = (uint64_t)sampleRate * captureMillis / 1000;
+  const uint64_t savedFrames = recByteSaved / (channels * 2U);
+  if (savedFrames + sampleRate / 10 < expectedFrames) {
+    recordingFailed = true;
+    Serial.println("Audio duration short: possible dropped capture blocks");
   }
+  if (!frec.seek(44ULL + recByteSaved) || !frec.truncate()) recordingFailed = true;
+  if (!writeOutHeader() || !frec.sync()) recordingFailed = true;
+  frec.close();
+  if (recordingFailed) {
+    sdFatal = true;
+    ++failedRecordings;
+    digitalWrite(LED_BUILTIN, HIGH);
+    char failedName[64];
+    snprintf(failedName, sizeof(failedName), "%s.failed", filename);
+    FsFile marker = SD.sdfs.open(failedName, O_WRONLY | O_CREAT | O_EXCL);
+    if (marker) {
+      marker.print("INCOMPLETE SONG BEAM WAV\nCaptureMs="); marker.println(captureMillis);
+      marker.print("SavedFrames="); marker.println((uint32_t)savedFrames);
+      marker.print("DroppedRingBlocks="); marker.println(dropped);
+      marker.print("MissingInputBlocks="); marker.println(missing);
+      marker.print("WorstSDWriteUs="); marker.println(worstWriteMicros);
+      marker.print("SdErrorCode="); marker.println(lastSdErrorCode);
+      marker.print("SdErrorData="); marker.println(lastSdErrorData);
+      marker.sync(); marker.close();
+    }
+    Serial.println("Recording incomplete: inspect WAV and .failed marker");
+  }
+  Serial.print("Max audio memory blocks: "); Serial.println(AudioMemoryUsageMax());
+  Serial.print("Max ring depth: "); Serial.println(maxRingDepth);
+  Serial.print("Capture ring capacity: "); Serial.println(capture.ring.capacity());
+  Serial.print("Dropped ring blocks: "); Serial.println(dropped);
+  Serial.print("Missing input blocks: "); Serial.println(missing);
+  Serial.print("Preparation ms: "); Serial.println(preparationMillis);
+  Serial.print("Capture ms: "); Serial.println(captureMillis);
+  Serial.print("Saved frames: "); Serial.println((uint32_t)savedFrames);
+  Serial.print("SD write calls: "); Serial.println(sdWriteCalls);
+  Serial.print("Worst SD write us: "); Serial.println(worstWriteMicros);
+  Serial.print("SD error code: "); Serial.println(lastSdErrorCode);
+  Serial.print("SD error data: "); Serial.println(lastSdErrorData);
+  if (AudioMemoryUsageMax() >= audioPoolBlocks) Serial.println("Audio pool saturated");
   mode = 0;
-  //Serial.print("finishedRecording ");
-  //Serial.println(now());
 }
 
+void stopRecording(char* fn) { stopRecordingChannels(4, fn); }
+void stopRecording2Chan(char* fn) { stopRecordingChannels(2, fn); }
 
-void writeOutHeader() { // update WAV header with final filesize/datasize
 
-//  NumSamples = (recByteSaved*8)/bitsPerSample/numChannels;
-//  Subchunk2Size = NumSamples*numChannels*bitsPerSample/8; // number of samples x number of channels x number of bytes per sample
-  Subchunk2Size = recByteSaved;
-  ChunkSize = Subchunk2Size + 36;
-  frec2.seek(0);
-  frec2.write("RIFF");
-  byte1 = ChunkSize & 0xff;
-  byte2 = (ChunkSize >> 8) & 0xff;
-  byte3 = (ChunkSize >> 16) & 0xff;
-  byte4 = (ChunkSize >> 24) & 0xff;  
-  frec2.write(byte1);  frec2.write(byte2);  frec2.write(byte3);  frec2.write(byte4);
-  frec2.write("WAVE");
-  frec2.write("fmt ");
-  byte1 = Subchunk1Size & 0xff;
-  byte2 = (Subchunk1Size >> 8) & 0xff;
-  byte3 = (Subchunk1Size >> 16) & 0xff;
-  byte4 = (Subchunk1Size >> 24) & 0xff;  
-  frec2.write(byte1);  frec2.write(byte2);  frec2.write(byte3);  frec2.write(byte4);
-  byte1 = AudioFormat & 0xff;
-  byte2 = (AudioFormat >> 8) & 0xff;
-  frec2.write(byte1);  frec2.write(byte2); 
-  byte1 = numChannels & 0xff;
-  byte2 = (numChannels >> 8) & 0xff;
-  frec2.write(byte1);  frec2.write(byte2); 
-  byte1 = sampleRate & 0xff;
-  byte2 = (sampleRate >> 8) & 0xff;
-  byte3 = (sampleRate >> 16) & 0xff;
-  byte4 = (sampleRate >> 24) & 0xff;  
-  frec2.write(byte1);  frec2.write(byte2);  frec2.write(byte3);  frec2.write(byte4);
-  byte1 = byteRate & 0xff;
-  byte2 = (byteRate >> 8) & 0xff;
-  byte3 = (byteRate >> 16) & 0xff;
-  byte4 = (byteRate >> 24) & 0xff;  
-  frec2.write(byte1);  frec2.write(byte2);  frec2.write(byte3);  frec2.write(byte4);
-  byte1 = blockAlign & 0xff;
-  byte2 = (blockAlign >> 8) & 0xff;
-  frec2.write(byte1);  frec2.write(byte2); 
-  byte1 = bitsPerSample & 0xff;
-  byte2 = (bitsPerSample >> 8) & 0xff;
-  frec2.write(byte1);  frec2.write(byte2); 
-  frec2.write("data");
-  byte1 = Subchunk2Size & 0xff;
-  byte2 = (Subchunk2Size >> 8) & 0xff;
-  byte3 = (Subchunk2Size >> 16) & 0xff;
-  byte4 = (Subchunk2Size >> 24) & 0xff;  
-  frec2.write(byte1);  frec2.write(byte2);  frec2.write(byte3);  frec2.write(byte4);
-  //frec.close();
-  ////Serial.println("header written"); 
-  ////Serial.print("Subchunk2: "); 
-  ////Serial.println(Subchunk2Size); 
+bool writeOutHeader() {
+  byte header[44];
+  songbeam::wavHeader(header, recByteSaved, sampleRate, numChannels);
+  return frec.seek(0) && frec.write(header, sizeof(header)) == sizeof(header);
 }
 
 char *makeFilename(){ 
   static char filename[40];
-  sprintf(filename, "%s_%04d_%02d_%02d_%02d_%02d_%02d%s", devname, year(), month(), day(), hour(), minute(), second(), postfix);
+  snprintf(filename, sizeof(filename), "%s_%04d_%02d_%02d_%02d_%02d_%02d%s", devname, year(), month(), day(), hour(), minute(), second(), postfix);
   return filename;  
 }
 
 time_t getTeensy3Time()
 {
   return Teensy3Clock.get();
-}
-
-void readconfigX(){
-  File myFile = SD.open("config.txt");
-  if (myFile) {
-    int x=0;
-    Serial.println("File available");
-    while (myFile.available()) {
-      Serial.println("Line read");
-      char* line=myFile.read();
-      Serial.println(line);
-      if (x>0){
-        int a=1;
-        String str=String(a);
-        if (x==1){
-          strcpy(devname, line);
-          //devname=line;
-        }
-        else if (x==2){
-          starttimehour=atoi(line);
-        }
-        else if (x==3){
-          starttimemin=atoi(line);
-        }
-        else if (x==4){
-          recordPeriodMins=atoi(line);
-        }
-        else if (x==5){
-          recmins=atoi(line);
-        }
-
-        x=0;
-      }
-
-      if (strcmp(line, "DeviceID:")==0){x=1;}
-      else if (strcmp(line, "RecordStartHrs:")==0){x=2;}
-      else if (strcmp(line, "RecordStartMins:")==0){x=3;}
-      else if (strcmp(line, "RecordLengthMins:")==0){x=4;}
-      else if (strcmp(line, "FileLengthMins:")==0){x=5;} 
-    }
-    myFile.close();
-  }
 }
 
 void readconfig(){
@@ -548,16 +733,16 @@ void readconfig(){
   FsFile file;
   for (int i=0; i<7; i++){recDay[i]=0;}
   if (file.open("config.txt", O_READ)) {
-    int ln = 1;
     int x=0;
     
     while ((n = file.fgets(line, sizeof(line))) > 0) {
-      line[strcspn(line, "\n")] = 0;
+      line[strcspn(line, "\r\n")] = 0;
       if (x>0){
         int a=1;
         String str=String(a);
         if (x==1){
-          strcpy(devname, line);
+          strncpy(devname, line, sizeof(devname)-1);
+          devname[sizeof(devname)-1] = '\0';
           //devname=line;
         }
         else if (x==2){
@@ -573,31 +758,34 @@ void readconfig(){
           recmins=atoi(line);
         }
         else if (x==6){
-          recDay[0]=1;
+          recDay[0]=atoi(line) != 0;
         }
         else if (x==7){
-          recDay[1]=1;
+          recDay[1]=atoi(line) != 0;
         }
         else if (x==8){
-          recDay[2]=1;
+          recDay[2]=atoi(line) != 0;
         }
         else if (x==9){
-          recDay[3]=1;
+          recDay[3]=atoi(line) != 0;
         }
         else if (x==10){
-          recDay[4]=1;
+          recDay[4]=atoi(line) != 0;
         }
         else if (x==11){
-          recDay[5]=1;
+          recDay[5]=atoi(line) != 0;
         }
         else if (x==12){
-          recDay[6]=1;
+          recDay[6]=atoi(line) != 0;
         }
         else if (x==13){
           numChannels=atoi(line);
         }
         else if (x==14){
           resistChoice=atoi(line);
+        }
+        else if (x==15){
+          autoRecordOnBoot=atoi(line) != 0;
         }
 
         x=0;
@@ -617,6 +805,7 @@ void readconfig(){
       else if (strcmp(line, "RecSat:")==0){x=12;} 
       else if (strcmp(line, "NumChan:")==0){x=13;}
       else if (strcmp(line, "Resist:")==0){x=14;}
+      else if (strcmp(line, "AutoRecordOnBoot:")==0){x=15;}
 
   }
   file.close();
