@@ -35,7 +35,7 @@ On the reviewed PCB, microphones A1/A2 share one ADAU7002 and A3/A4 share the ot
 
 The ten-file check verifies continuity within each WAV. The current implementation stops capture during rotation, with about 1.5 seconds of deliberate delays plus card preparation between files. Gapless rotation requires a separate implementation and sample-count verification across file boundaries.
 
-The latest power-cycle diagnostic failed RTC retention: both active and backup clocks restarted at the core's January 2019 fallback with a user-reported 3.25 V on the SongBeam side of the connector. The user subsequently clarified that this was not a measurement on the Teensy itself; the Teensy-side RTC header appears unpopulated and its connection must be checked. The firmware correctly refuses recording with invalid time. Do not treat setting host time over USB as a fix for battery-backed retention.
+Before repair, both active and backup clocks restarted at the core's January 2019 fallback after power-off. The 3.25 V reading was on the SongBeam side of the connector; the user confirmed the Teensy-side RTC header was missing. After fitting the three-pin header, an RTC-only diagnostic retained both clocks during a measured 47-second USB power-off interval, within one second of host UTC. Recorder-firmware retention and longer unpowered intervals remain pending. The firmware correctly refuses recording with invalid time. Do not treat setting host time over USB as a fix for battery-backed retention.
 
 ## Acceptance gates
 
